@@ -468,26 +468,55 @@ void AbyssMC::emitICmp(ICmpInst &CI) {
 }
 
 void AbyssMC::emitGEP(GetElementPtrInst &GEP) {
-  if (GEP.getNumIndices() != 1 || GEP.getNumOperands() != 2)
-    report_fatal_error("Abyss: only one-index GEPs are supported");
-
   const DataLayout &DL = M.getDataLayout();
-  uint64_t Size = DL.getTypeAllocSize(GEP.getSourceElementType());
+  Type *Ty = GEP.getSourceElementType();
 
+  // Address accumulator lives in T0.
   loadValue(T0, GEP.getPointerOperand());
-  loadValue(T1, GEP.getOperand(1));
 
-  if (Size != 1) {
-    if (isPowerOf2_64(Size)) {
-      i(Abyss::SLLI, T1, T1, Log2_64(Size));
-    } else {
-      emitConst(T2, static_cast<int64_t>(Size));
-      r(Abyss::MUL, T1, T1, T2);
+  auto AddScaledIndex = [&](Value *Idx, uint64_t Size) {
+    loadValue(T1, Idx);
+    if (Size != 1) {
+      if (isPowerOf2_64(Size)) {
+        i(Abyss::SLLI, T1, T1, Log2_64(Size));
+      } else {
+        emitConst(T2, static_cast<int64_t>(Size));
+        r(Abyss::MUL, T1, T1, T2);
+      }
     }
+    r(Abyss::ADD, T0, T0, T1);
+  };
+
+  // The first GEP index walks over whole source elements.
+  AddScaledIndex(GEP.getOperand(1),
+                 DL.getTypeAllocSize(Ty).getFixedValue());
+
+  for (unsigned OpNo = 2; OpNo < GEP.getNumOperands(); ++OpNo) {
+    if (auto *ST = dyn_cast<StructType>(Ty)) {
+      auto *CI = dyn_cast<ConstantInt>(GEP.getOperand(OpNo));
+      if (!CI)
+        report_fatal_error("Abyss: non-constant struct GEP index");
+      unsigned Field = CI->getZExtValue();
+      int64_t Offset = DL.getStructLayout(ST)->getElementOffset(Field);
+      if (Offset) {
+        emitConst(T1, Offset);
+        r(Abyss::ADD, T0, T0, T1);
+      }
+      Ty = ST->getElementType(Field);
+      continue;
+    }
+
+    if (auto *AT = dyn_cast<ArrayType>(Ty)) {
+      AddScaledIndex(GEP.getOperand(OpNo),
+                     DL.getTypeAllocSize(AT->getElementType()).getFixedValue());
+      Ty = AT->getElementType();
+      continue;
+    }
+
+    report_fatal_error("Abyss: unsupported GEP aggregate type");
   }
 
-  r(Abyss::ADD, T2, T0, T1);
-  storeSlot(&GEP, T2);
+  storeSlot(&GEP, T0);
 }
 
 void AbyssMC::emitLoad(LoadInst &LI) {
@@ -499,7 +528,9 @@ void AbyssMC::emitLoad(LoadInst &LI) {
       IsUnsigned = true;
 
   unsigned Op = Abyss::LDR;
-  if (Ty->isIntegerTy(8))
+  if (Ty->isPointerTy())
+    Op = Abyss::LDR;
+  else if (Ty->isIntegerTy(8))
     Op = IsUnsigned ? Abyss::LBU : Abyss::LB;
   else if (Ty->isIntegerTy(16))
     Op = IsUnsigned ? Abyss::LHU : Abyss::LH;
@@ -512,7 +543,9 @@ void AbyssMC::emitLoad(LoadInst &LI) {
 void AbyssMC::emitStore(StoreInst &SI) {
   Type *Ty = SI.getValueOperand()->getType();
   unsigned Op = Abyss::STR;
-  if (Ty->isIntegerTy(8))
+  if (Ty->isPointerTy())
+    Op = Abyss::STR;
+  else if (Ty->isIntegerTy(8))
     Op = Abyss::SB;
   else if (Ty->isIntegerTy(16))
     Op = Abyss::SH;
