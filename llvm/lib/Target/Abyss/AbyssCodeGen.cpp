@@ -282,6 +282,9 @@ unsigned AbyssMC::destReg(const Value *V, unsigned Scratch) const {
 }
 
 unsigned AbyssMC::operandReg(unsigned Scratch, const Value *V) {
+  if (auto *CI = dyn_cast<ConstantInt>(V))
+    if (CI->isZero())
+      return X0;
   auto It = RegAssign.find(V);
   if (It != RegAssign.end() && RegLive.count(V))
     return It->second;
@@ -512,12 +515,24 @@ void AbyssMC::emitFunction(Function &F) {
 void AbyssMC::emitBlock(Function &F, BasicBlock &BB) {
   Streamer->emitLabel(blockSymbol(&BB));
   beginBlockRegisters(BB);
+  // A conditional branch materializes its own operands.  Do not also emit the
+  // ICmp as a value: that produced a second SLT plus a second copy of the
+  // comparison constants on every loop iteration.
+  const ICmpInst *BranchCond = nullptr;
+  if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator()))
+    if (BI->isConditional())
+      if (auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition()))
+        if (Cmp->hasOneUse())
+          BranchCond = Cmp;
+
   for (Instruction &I : BB) {
     if (I.isTerminator()) {
       flushBlockValues(/*Force=*/false);
       emitTerminator(F, BB, I);
       break;
     }
+    if (&I == BranchCond)
+      continue;
     emitInstruction(F, BB, I);
   }
 }
@@ -543,10 +558,150 @@ void AbyssMC::emitCopy(Instruction &I, const Value *V) {
 }
 
 void AbyssMC::emitBinary(BinaryOperator &BO) {
+  auto *C0 = dyn_cast<ConstantInt>(BO.getOperand(0));
+  auto *C1 = dyn_cast<ConstantInt>(BO.getOperand(1));
+  unsigned D = destReg(&BO, T2);
+  auto IsImm12 = [](int64_t V) { return V >= -2048 && V <= 2047; };
+  auto Finish = [&]() { storeSlot(&BO, D); };
+
+  // ADDI / ANDI / ORI / XORI / shifts avoid materializing a constant in a
+  // register.  Constants in the left operand are commutative for add/and/or/
+  // xor, so canonicalize them to the right.
+  switch (BO.getOpcode()) {
+  case Instruction::Add:
+    if (C1 && IsImm12(C1->getSExtValue())) {
+      i(Abyss::ADDI, D, operandReg(T0, BO.getOperand(0)),
+        C1->getSExtValue());
+      Finish();
+      return;
+    }
+    if (C0 && IsImm12(C0->getSExtValue())) {
+      i(Abyss::ADDI, D, operandReg(T0, BO.getOperand(1)),
+        C0->getSExtValue());
+      Finish();
+      return;
+    }
+    break;
+  case Instruction::Sub:
+    if (C1 && IsImm12(-C1->getSExtValue())) {
+      i(Abyss::ADDI, D, operandReg(T0, BO.getOperand(0)),
+        -C1->getSExtValue());
+      Finish();
+      return;
+    }
+    break;
+  case Instruction::Mul: {
+    // Multiplication by a power of two is a shift; by 0/1 is a move.
+    auto TryMul = [&](ConstantInt *C, const Value *Other) {
+      int64_t V = C->getSExtValue();
+      if (V == 0) {
+        i(Abyss::ADDI, D, X0, 0);
+        Finish();
+        return true;
+      }
+      if (V == 1) {
+        i(Abyss::ADDI, D, operandReg(T0, Other), 0);
+        Finish();
+        return true;
+      }
+      if (V == -1) {
+        r(Abyss::SUB, D, X0, operandReg(T0, Other));
+        Finish();
+        return true;
+      }
+      if (V > 0 && isPowerOf2_64(static_cast<uint64_t>(V))) {
+        i(Abyss::SLLI, D, operandReg(T0, Other), Log2_64(V));
+        Finish();
+        return true;
+      }
+      return false;
+    };
+    if (C1 && TryMul(C1, BO.getOperand(0)))
+      return;
+    if (C0 && TryMul(C0, BO.getOperand(1)))
+      return;
+    break;
+  }
+  case Instruction::And:
+  case Instruction::Or:
+  case Instruction::Xor: {
+    unsigned Op = BO.getOpcode() == Instruction::And
+                      ? Abyss::ANDI
+                      : BO.getOpcode() == Instruction::Or ? Abyss::ORI
+                                                          : Abyss::XORI;
+    if (C1 && IsImm12(C1->getSExtValue())) {
+      i(Op, D, operandReg(T0, BO.getOperand(0)), C1->getSExtValue());
+      Finish();
+      return;
+    }
+    if (C0 && IsImm12(C0->getSExtValue())) {
+      i(Op, D, operandReg(T0, BO.getOperand(1)), C0->getSExtValue());
+      Finish();
+      return;
+    }
+    break;
+  }
+  case Instruction::Shl:
+  case Instruction::LShr:
+  case Instruction::AShr:
+    if (C1 && C1->getZExtValue() < 32) {
+      unsigned Op = BO.getOpcode() == Instruction::Shl
+                        ? Abyss::SLLI
+                        : BO.getOpcode() == Instruction::LShr ? Abyss::SRLI
+                                                              : Abyss::SRAI;
+      i(Op, D, operandReg(T0, BO.getOperand(0)),
+        static_cast<int64_t>(C1->getZExtValue()));
+      Finish();
+      return;
+    }
+    break;
+  case Instruction::SDiv:
+  case Instruction::SRem:
+  case Instruction::UDiv:
+  case Instruction::URem: {
+    bool IsRem = BO.getOpcode() == Instruction::SRem ||
+                 BO.getOpcode() == Instruction::URem;
+    int64_t Div = C1 ? C1->getSExtValue() : 0;
+    //
+    // Only unsigned division is strength-reduced.  Signed division needs a
+    // sign correction (SRAI/AND/ADD/SRAI), which is slower than the single
+    // DIV instruction on Abyss; keep the native DIV for SDiv/SRem.
+    //
+    if (BO.getOpcode() == Instruction::UDiv ||
+        BO.getOpcode() == Instruction::URem) {
+      if (Div > 0 && isPowerOf2_64(static_cast<uint64_t>(Div))) {
+        unsigned K = Log2_64(static_cast<uint64_t>(Div));
+        uint64_t Mask = static_cast<uint64_t>(Div) - 1;
+        unsigned L = operandReg(T0, BO.getOperand(0));
+
+        if (Div == 1) {
+          if (IsRem)
+            i(Abyss::ADDI, D, X0, 0);
+          else
+            i(Abyss::ADDI, D, L, 0);
+          Finish();
+          return;
+        }
+        if (!IsRem) {
+          i(Abyss::SRLI, D, L, K);
+        } else if (Mask <= 2047) {
+          i(Abyss::ANDI, D, L, static_cast<int64_t>(Mask));
+        } else {
+          emitConst(T2, static_cast<int64_t>(Mask));
+          r(Abyss::AND, D, L, T2);
+        }
+        Finish();
+        return;
+      }
+    }
+    break;
+  }
+  default:
+    break;
+  }
+
   unsigned L = operandReg(T0, BO.getOperand(0));
   unsigned R = operandReg(T1, BO.getOperand(1));
-  unsigned D = destReg(&BO, T2);
-
   switch (BO.getOpcode()) {
   case Instruction::Add:
     r(Abyss::ADD, D, L, R);
@@ -590,13 +745,71 @@ void AbyssMC::emitBinary(BinaryOperator &BO) {
   default:
     report_fatal_error("Abyss: unsupported binary operator");
   }
-  storeSlot(&BO, D);
+  Finish();
 }
 
 void AbyssMC::emitICmp(ICmpInst &CI) {
+  unsigned D = destReg(&CI, T2);
+  auto Finish = [&]() { storeSlot(&CI, D); };
+
+  // SLTI/SLTIU and XORI avoid materializing small right-hand constants.
+  if (auto *CR = dyn_cast<ConstantInt>(CI.getOperand(1))) {
+    int64_t K = CR->getSExtValue();
+    if (K >= 0 && K <= 2047) {
+      unsigned L = operandReg(T0, CI.getOperand(0));
+      switch (CI.getPredicate()) {
+      case CmpInst::ICMP_EQ:
+        i(Abyss::XORI, D, L, K);
+        i(Abyss::SLTIU, D, D, 1);
+        Finish();
+        return;
+      case CmpInst::ICMP_NE:
+        i(Abyss::XORI, D, L, K);
+        r(Abyss::SLTU, D, X0, D);
+        Finish();
+        return;
+      case CmpInst::ICMP_SLT:
+        i(Abyss::SLTI, D, L, K);
+        Finish();
+        return;
+      case CmpInst::ICMP_SGE:
+        i(Abyss::SLTI, D, L, K);
+        i(Abyss::XORI, D, D, 1);
+        Finish();
+        return;
+      case CmpInst::ICMP_ULT:
+        i(Abyss::SLTIU, D, L, K);
+        Finish();
+        return;
+      case CmpInst::ICMP_UGE:
+        i(Abyss::SLTIU, D, L, K);
+        i(Abyss::XORI, D, D, 1);
+        Finish();
+        return;
+      case CmpInst::ICMP_SLE:
+      case CmpInst::ICMP_SGT:
+      case CmpInst::ICMP_ULE:
+      case CmpInst::ICMP_UGT:
+        if (K < 2047) {
+          bool Unsigned = CI.getPredicate() == CmpInst::ICMP_ULE ||
+                          CI.getPredicate() == CmpInst::ICMP_UGT;
+          unsigned Op = Unsigned ? Abyss::SLTIU : Abyss::SLTI;
+          i(Op, D, L, K + 1);
+          if (CI.getPredicate() == CmpInst::ICMP_SGT ||
+              CI.getPredicate() == CmpInst::ICMP_UGT)
+            i(Abyss::XORI, D, D, 1);
+          Finish();
+          return;
+        }
+        break;
+      default:
+        break;
+      }
+    }
+  }
+
   unsigned L = operandReg(T0, CI.getOperand(0));
   unsigned R = operandReg(T1, CI.getOperand(1));
-  unsigned D = destReg(&CI, T2);
 
   switch (CI.getPredicate()) {
   case CmpInst::ICMP_EQ:
@@ -644,6 +857,26 @@ void AbyssMC::emitICmp(ICmpInst &CI) {
 void AbyssMC::emitGEP(GetElementPtrInst &GEP) {
   const DataLayout &DL = M.getDataLayout();
   Type *Ty = GEP.getSourceElementType();
+
+  // The common `p + index * sizeof(T)` form with a null base needs no zero
+  // accumulator and no final ADD: scale the index directly.
+  if (isa<ConstantPointerNull>(GEP.getPointerOperand()) &&
+      GEP.getNumOperands() == 2) {
+    unsigned D = destReg(&GEP, T0);
+    unsigned Src = operandReg(D, GEP.getOperand(1));
+    uint64_t Size = DL.getTypeAllocSize(Ty).getFixedValue();
+    if (Size == 1) {
+      if (Src != D)
+        i(Abyss::ADDI, D, Src, 0);
+    } else if (isPowerOf2_64(Size)) {
+      i(Abyss::SLLI, D, Src, Log2_64(Size));
+    } else {
+      emitConst(T1, static_cast<int64_t>(Size));
+      r(Abyss::MUL, D, Src, T1);
+    }
+    storeSlot(&GEP, D);
+    return;
+  }
 
   // Address accumulator lives in T0.
   loadValue(T0, GEP.getPointerOperand());
@@ -737,19 +970,40 @@ void AbyssMC::emitSelect(BasicBlock &BB, SelectInst &SI) {
   // Branchless select.  Abyss cores serialize divergent threads, so emitting
   // a real branch here is not only slower but can expose stale stores on the
   // inactive path.  Build an all-ones/all-zero mask instead:
-  //   mask = -(cond != 0)
+  //   mask = -(cond)
   //   result = (true & mask) | (false & ~mask)
-  loadValue(T0, SI.getCondition());
-  r(Abyss::SLTU, T0, X0, T0);
-  r(Abyss::SUB, T0, X0, T0);
+  // The condition is i1, so it is already 0/1; SUB is enough (no SLTU).
+  unsigned C = operandReg(T0, SI.getCondition());
+  r(Abyss::SUB, T0, X0, C);
 
-  unsigned TV = operandReg(T1, SI.getTrueValue());
-  unsigned FV = operandReg(T2, SI.getFalseValue());
-  r(Abyss::AND, T3, TV, T0);
-  i(Abyss::XORI, T4, T0, -1);
-  r(Abyss::AND, T1, FV, T4);
+  auto IsZero = [](const Value *V) {
+    if (auto *CI = dyn_cast<ConstantInt>(V))
+      return CI->isZero();
+    return false;
+  };
+  bool TVZero = IsZero(SI.getTrueValue());
+  bool FVZero = IsZero(SI.getFalseValue());
   unsigned D = destReg(&SI, T3);
-  r(Abyss::OR, D, T3, T1);
+
+  if (TVZero && FVZero) {
+    i(Abyss::ADDI, D, X0, 0);
+  } else if (FVZero) {
+    // result = true & mask
+    unsigned TV = operandReg(T1, SI.getTrueValue());
+    r(Abyss::AND, D, TV, T0);
+  } else if (TVZero) {
+    // result = false & ~mask
+    i(Abyss::XORI, T4, T0, -1);
+    unsigned FV = operandReg(T1, SI.getFalseValue());
+    r(Abyss::AND, D, FV, T4);
+  } else {
+    unsigned TV = operandReg(T1, SI.getTrueValue());
+    unsigned FV = operandReg(T2, SI.getFalseValue());
+    r(Abyss::AND, T3, TV, T0);
+    i(Abyss::XORI, T4, T0, -1);
+    r(Abyss::AND, T1, FV, T4);
+    r(Abyss::OR, D, T3, T1);
+  }
   storeSlot(&SI, D);
 }
 
@@ -757,20 +1011,22 @@ void AbyssMC::emitMinMax(CallInst &CI, BasicBlock &, bool IsMin,
                          bool IsUnsigned) {
   if (CI.arg_size() != 2)
     report_fatal_error("Abyss: min/max intrinsic expects two arguments");
-  loadValue(T0, CI.getArgOperand(0));
-  loadValue(T1, CI.getArgOperand(1));
+  unsigned L = operandReg(T0, CI.getArgOperand(0));
+  unsigned R = operandReg(T1, CI.getArgOperand(1));
 
-  // Branchless min/max, for the same reason as emitSelect.
+  // Branchless min/max, for the same reason as emitSelect.  Keep the two
+  // ANDs independent after the mask: on the in-order Abyss pipeline this is
+  // faster than a shorter but more serial XOR-select chain.
   unsigned Cmp = IsUnsigned ? Abyss::SLTU : Abyss::SLT;
   if (IsMin)
-    r(Cmp, T2, T0, T1);
+    r(Cmp, T2, L, R);
   else
-    r(Cmp, T2, T1, T0);
+    r(Cmp, T2, R, L);
   r(Abyss::SUB, T2, X0, T2);
 
-  r(Abyss::AND, T3, T0, T2);
+  r(Abyss::AND, T3, L, T2);
   i(Abyss::XORI, T4, T2, -1);
-  r(Abyss::AND, T1, T1, T4);
+  r(Abyss::AND, T1, R, T4);
   unsigned D = destReg(&CI, T3);
   r(Abyss::OR, D, T3, T1);
   storeSlot(&CI, D);
@@ -969,9 +1225,9 @@ void AbyssMC::emitTerminator(Function &F, BasicBlock &BB, Instruction &I) {
     MCSymbol *FalseEdge = newLabel(&BB, "edge.f");
 
     if (auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition())) {
-      loadValue(T0, Cmp->getOperand(0));
-      loadValue(T1, Cmp->getOperand(1));
-      emitBranchPred(Cmp->getPredicate(), T0, T1, TrueEdge);
+      unsigned L = operandReg(T0, Cmp->getOperand(0));
+      unsigned R = operandReg(T1, Cmp->getOperand(1));
+      emitBranchPred(Cmp->getPredicate(), L, R, TrueEdge);
     } else {
       loadValue(T0, BI->getCondition());
       b(Abyss::BNE, T0, X0, TrueEdge);
