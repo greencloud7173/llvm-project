@@ -11,7 +11,8 @@ Target &llvm::getTheAbyssTarget() {
 }
 
 extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAbyssTargetInfo() {
-  TargetRegistry::RegisterTarget(getTheAbyssTarget(), "abyss", "Abyss", "Abyss", 
-  [](Triple::ArchType) { return false; }, 
-  /*HasJIT=*/false);
+  TargetRegistry::RegisterTarget(
+      getTheAbyssTarget(), "abyss", "Abyss", "Abyss",
+      [](Triple::ArchType Arch) { return Arch == Triple::abyss; },
+      /*HasJIT=*/false);
 }

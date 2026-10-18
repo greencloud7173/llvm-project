@@ -11,21 +11,31 @@ tablegen(LLVM AbyssGenSubtargetInfo.inc -gen-subtarget)
 
 add_public_tablegen_target(AbyssCommonTableGen)
 
-# Assembler-only milestone: only the target registration entry point is needed
-# here.  The real TargetMachine will replace this stub when codegen is added.
+# Minimal direct-IR backend: the Abyss MC layer already describes every
+# instruction, so AbyssCodeGen.cpp emits MCInsts directly and avoids a large
+# SelectionDAG/register-allocator implementation.
 add_llvm_target(AbyssCodeGen
-  AbyssCodeGenStub.cpp
+  AbyssCodeGen.cpp
+  AbyssTargetMachineImpl.cpp
 
-  # AbyssTargetMachine.cpp is still a work-in-progress Sparc copy and is
-  # intentionally excluded until the real TargetMachine is ported.
   PARTIAL_SOURCES_INTENDED
 
   LINK_COMPONENTS
+  Analysis
+  CodeGen
+  Core
+  MC
+  AbyssDesc
+  AbyssInfo
+  Target
   Support
 
   ADD_TO_COMPONENT
   Abyss
   )
+
+# The historical Sparc-derived TargetMachine/stub files were removed; this
+# target now uses AbyssCodeGen.cpp + AbyssTargetMachineImpl.cpp exclusively.
 
 add_subdirectory(AsmParser)
 add_subdirectory(MCTargetDesc)

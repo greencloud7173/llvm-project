@@ -14,6 +14,7 @@
 #include "Targets.h"
 
 #include "Targets/AArch64.h"
+#include "Targets/Abyss.h"
 #include "Targets/AMDGPU.h"
 #include "Targets/ARC.h"
 #include "Targets/ARM.h"
@@ -268,6 +269,8 @@ std::unique_ptr<TargetInfo> AllocateTarget(const llvm::Triple &Triple,
       return std::make_unique<ARMbeTargetInfo>(Triple, Opts);
     }
 
+  case llvm::Triple::abyss:
+    return std::make_unique<AbyssTargetInfo>(Triple, Opts);
   case llvm::Triple::avr:
     return std::make_unique<AVRTargetInfo>(Triple, Opts);
   case llvm::Triple::bpfeb:
