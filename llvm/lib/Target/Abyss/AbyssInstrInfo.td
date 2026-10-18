@@ -31,7 +31,7 @@ def Imm21 : Operand<i32> {
 }
 
 //===----------------------------------------------------------------------===//
-// R-type: ADD SUB MUL DIV SLL SRL SRA
+// R-type: ADD SUB MUL DIV DIVU REM REMU SLL SRL SRA
 //===----------------------------------------------------------------------===//
 def ADD : RType<0b0110011, 0b000, 0b0000000,
                 (outs XRegs:$rd), (ins XRegs:$rs1, XRegs:$rs2),
@@ -45,6 +45,15 @@ def MUL : RType<0b0110011, 0b000, 0b0000001,
 def DIV : RType<0b0110011, 0b100, 0b0000001,
                 (outs XRegs:$rd), (ins XRegs:$rs1, XRegs:$rs2),
                 "div $rd, $rs1, $rs2">;
+def DIVU : RType<0b0110011, 0b101, 0b0000001,
+                 (outs XRegs:$rd), (ins XRegs:$rs1, XRegs:$rs2),
+                 "divu $rd, $rs1, $rs2">;
+def REM : RType<0b0110011, 0b110, 0b0000001,
+                (outs XRegs:$rd), (ins XRegs:$rs1, XRegs:$rs2),
+                "rem $rd, $rs1, $rs2">;
+def REMU : RType<0b0110011, 0b111, 0b0000001,
+                 (outs XRegs:$rd), (ins XRegs:$rs1, XRegs:$rs2),
+                 "remu $rd, $rs1, $rs2">;
 def SLL : RType<0b0110011, 0b001, 0b0000000,
                 (outs XRegs:$rd), (ins XRegs:$rs1, XRegs:$rs2),
                 "sll $rd, $rs1, $rs2">;
@@ -54,6 +63,12 @@ def SRL : RType<0b0110011, 0b101, 0b0000000,
 def SRA : RType<0b0110011, 0b101, 0b0100000,
                 (outs XRegs:$rd), (ins XRegs:$rs1, XRegs:$rs2),
                 "sra $rd, $rs1, $rs2">;
+def SLT : RType<0b0110011, 0b010, 0b0000000,
+                (outs XRegs:$rd), (ins XRegs:$rs1, XRegs:$rs2),
+                "slt $rd, $rs1, $rs2">;
+def SLTU : RType<0b0110011, 0b011, 0b0000000,
+                 (outs XRegs:$rd), (ins XRegs:$rs1, XRegs:$rs2),
+                 "sltu $rd, $rs1, $rs2">;
 
 //===----------------------------------------------------------------------===//
 // I-type: ADDI LDR LB LH LBU LHU SLLI SRLI SRAI; S-type: STR SB SH
@@ -61,6 +76,12 @@ def SRA : RType<0b0110011, 0b101, 0b0100000,
 def ADDI : IType<0b0010011, 0b000,
                  (outs XRegs:$rd), (ins XRegs:$rs1, Imm12:$imm),
                  "addi $rd, $rs1, #$imm">;
+def SLTI : IType<0b0010011, 0b010,
+                 (outs XRegs:$rd), (ins XRegs:$rs1, Imm12:$imm),
+                 "slti $rd, $rs1, #$imm">;
+def SLTIU : IType<0b0010011, 0b011,
+                  (outs XRegs:$rd), (ins XRegs:$rs1, Imm12:$imm),
+                  "sltiu $rd, $rs1, #$imm">;
 def SLLI : ShiftIType<0b0010011, 0b001, 0b0000000,
                       (outs XRegs:$rd), (ins XRegs:$rs1, Imm5:$shamt),
                       "slli $rd, $rs1, $shamt">;
