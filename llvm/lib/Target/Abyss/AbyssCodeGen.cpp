@@ -78,6 +78,8 @@ class AbyssMC {
   static constexpr unsigned T0 = Abyss::X5;
   static constexpr unsigned T1 = Abyss::X6;
   static constexpr unsigned T2 = Abyss::X7;
+  static constexpr unsigned T3 = Abyss::X8;
+  static constexpr unsigned T4 = Abyss::X9;
 
 public:
   AbyssMC(Module &M, const Target &T, raw_pwrite_stream &Out,
@@ -559,52 +561,45 @@ void AbyssMC::emitStore(StoreInst &SI) {
 }
 
 void AbyssMC::emitSelect(BasicBlock &BB, SelectInst &SI) {
+  (void)BB;
+  // Branchless select.  Abyss cores serialize divergent threads, so emitting
+  // a real branch here is not only slower but can expose stale stores on the
+  // inactive path.  Build an all-ones/all-zero mask instead:
+  //   mask = -(cond != 0)
+  //   result = (true & mask) | (false & ~mask)
   loadValue(T0, SI.getCondition());
-  MCSymbol *TrueL = newLabel(&BB, "select.t");
-  MCSymbol *FalseL = newLabel(&BB, "select.f");
-  MCSymbol *EndL = newLabel(&BB, "select.e");
-  b(Abyss::BNE, T0, X0, TrueL);
-  jal(X0, FalseL);
-  Streamer->emitLabel(TrueL);
+  r(Abyss::SLTU, T0, X0, T0);
+  r(Abyss::SUB, T0, X0, T0);
+
   loadValue(T1, SI.getTrueValue());
-  storeSlot(&SI, T1);
-  jal(X0, EndL);
-  Streamer->emitLabel(FalseL);
-  loadValue(T1, SI.getFalseValue());
-  storeSlot(&SI, T1);
-  Streamer->emitLabel(EndL);
+  loadValue(T2, SI.getFalseValue());
+  r(Abyss::AND, T3, T1, T0);
+  i(Abyss::XORI, T4, T0, -1);
+  r(Abyss::AND, T2, T2, T4);
+  r(Abyss::OR, T3, T3, T2);
+  storeSlot(&SI, T3);
 }
 
-void AbyssMC::emitMinMax(CallInst &CI, BasicBlock &BB, bool IsMin,
+void AbyssMC::emitMinMax(CallInst &CI, BasicBlock &, bool IsMin,
                          bool IsUnsigned) {
   if (CI.arg_size() != 2)
     report_fatal_error("Abyss: min/max intrinsic expects two arguments");
   loadValue(T0, CI.getArgOperand(0));
   loadValue(T1, CI.getArgOperand(1));
 
-  MCSymbol *UseFirst = newLabel(&BB, IsMin ? "min.first" : "max.first");
-  MCSymbol *End = newLabel(&BB, IsMin ? "min.end" : "max.end");
+  // Branchless min/max, for the same reason as emitSelect.
+  unsigned Cmp = IsUnsigned ? Abyss::SLTU : Abyss::SLT;
+  if (IsMin)
+    r(Cmp, T2, T0, T1);
+  else
+    r(Cmp, T2, T1, T0);
+  r(Abyss::SUB, T2, X0, T2);
 
-  // Branch when the first operand wins.
-  if (IsUnsigned) {
-    if (IsMin)
-      b(Abyss::BLTU, T0, T1, UseFirst);
-    else
-      b(Abyss::BLTU, T1, T0, UseFirst);
-  } else {
-    if (IsMin)
-      b(Abyss::BLT, T0, T1, UseFirst);
-    else
-      b(Abyss::BLT, T1, T0, UseFirst);
-  }
-
-  // Default: second operand.
-  i(Abyss::ADDI, T2, T1, 0);
-  jal(X0, End);
-  Streamer->emitLabel(UseFirst);
-  i(Abyss::ADDI, T2, T0, 0);
-  Streamer->emitLabel(End);
-  storeSlot(&CI, T2);
+  r(Abyss::AND, T3, T0, T2);
+  i(Abyss::XORI, T4, T2, -1);
+  r(Abyss::AND, T1, T1, T4);
+  r(Abyss::OR, T3, T3, T1);
+  storeSlot(&CI, T3);
 }
 
 void AbyssMC::emitCall(CallInst &CI, BasicBlock &BB) {
