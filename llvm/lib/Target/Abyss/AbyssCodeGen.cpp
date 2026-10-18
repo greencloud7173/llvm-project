@@ -14,6 +14,9 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -44,6 +47,7 @@
 #include "llvm/Target/TargetMachine.h"
 #include <cassert>
 #include <cstdint>
+#include <functional>
 #include <string>
 
 using namespace llvm;
@@ -80,9 +84,21 @@ class AbyssMC {
   DenseMap<const BasicBlock *, std::string> BlockNames;
   DenseSet<const Value *> NeedsSlot;
   DenseSet<const Value *> NeedOwnSlot;
+  // No-op values (currently freeze) are aliases, not separate SSA values.
+  DenseMap<const Value *, const Value *> Aliases;
+  // Header PHIs of simple loops stay in a fixed register across the backedge.
+  DenseMap<const Value *, unsigned> PinnedReg;
+  DenseMap<const Value *, const Loop *> PinnedLoop;
+  DenseMap<const BasicBlock *, SmallVector<const Value *, 2>> BlockPinned;
+  DenseMap<const ConstantInt *, unsigned> PinnedConst;
+  bool FunctionHasCalls = false;
+  std::unique_ptr<DominatorTree> LoopDT;
+  std::unique_ptr<LoopInfo> LoopAnalysis;
   DenseMap<const Value *, unsigned> RegAssign;
   DenseSet<const Value *> RegLive;
   SmallVector<const Value *, 32> BlockValues;
+  SmallVector<MCInst, 64> PendingInsts;
+  bool Scheduling = false;
   std::string FnName;
   unsigned NextSlot = 0;
   unsigned NextLabel = 0;
@@ -115,7 +131,10 @@ private:
     Inst.setOpcode(Opcode);
     for (const MCOperand &Op : Ops)
       Inst.addOperand(Op);
-    Streamer->emitInstruction(Inst, *STI);
+    if (Scheduling)
+      PendingInsts.push_back(Inst);
+    else
+      Streamer->emitInstruction(Inst, *STI);
   }
   void r(unsigned Opcode, unsigned Rd, unsigned Rs1, unsigned Rs2) {
     mc(Opcode, {reg(Rd), reg(Rs1), reg(Rs2)});
@@ -136,12 +155,17 @@ private:
   // startup stub to stop the machine; functions need a real return.
   void ret() { mc(Abyss::JALR, {reg(X0), reg(RA), imm(0)}); }
 
+  const Value *resolve(const Value *V) const;
+  void beginSchedule();
+  void flushSchedule();
+  void scheduleAndEmit(SmallVectorImpl<MCInst> &Insts);
   void emitConst(unsigned Rd, int64_t Value);
   void loadValue(unsigned Rd, const Value *V);
   void storeSlot(const Value *V, unsigned Rs);
   unsigned destReg(const Value *V, unsigned Scratch) const;
   unsigned operandReg(unsigned Scratch, const Value *V);
   void beginBlockRegisters(BasicBlock &BB);
+  void assignLoopRegisters(Function &F);
   void flushBlockValues(bool Force);
   unsigned slotOf(const Value *V) const;
   int slotOffset(const Value *V) const;
@@ -152,6 +176,7 @@ private:
   void emitTerminator(Function &F, BasicBlock &BB, Instruction &I);
   void restoreStackPointer();
   void emitBinary(BinaryOperator &BO);
+  bool emitPinnedPhiUpdate(BinaryOperator &BO, BasicBlock &BB);
   void emitICmp(ICmpInst &CI);
   void emitGEP(GetElementPtrInst &GEP);
   void emitLoad(LoadInst &LI);
@@ -209,6 +234,159 @@ AbyssMC::AbyssMC(Module &M, const Target &T, raw_pwrite_stream &Out,
   Streamer->switchSection(Ctx->getObjectFileInfo()->getTextSection());
 }
 
+const Value *AbyssMC::resolve(const Value *V) const {
+  for (unsigned Depth = 0; Depth != 8; ++Depth) {
+    auto It = Aliases.find(V);
+    if (It == Aliases.end())
+      break;
+    V = It->second;
+  }
+  return V;
+}
+
+static bool isAbyssLoad(unsigned Opcode) {
+  switch (Opcode) {
+  case Abyss::LDR:
+  case Abyss::LB:
+  case Abyss::LH:
+  case Abyss::LBU:
+  case Abyss::LHU:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool isAbyssStore(unsigned Opcode) {
+  switch (Opcode) {
+  case Abyss::STR:
+  case Abyss::SB:
+  case Abyss::SH:
+    return true;
+  default:
+    return false;
+  }
+}
+
+void AbyssMC::beginSchedule() {
+  PendingInsts.clear();
+  // The list scheduler below is kept as an option, but is disabled by default:
+  // measured 1.8% slower on raster64x64.  With eight resident threads the
+  // original source order already hides most ALU latency, and reordering adds
+  // I-cache pressure.
+  Scheduling = false;
+}
+
+void AbyssMC::scheduleAndEmit(SmallVectorImpl<MCInst> &Insts) {
+  unsigned N = Insts.size();
+  if (N < 2) {
+    for (MCInst &Inst : Insts)
+      Streamer->emitInstruction(Inst, *STI);
+    return;
+  }
+
+  struct Info {
+    SmallVector<unsigned, 2> Defs;
+    SmallVector<unsigned, 3> Uses;
+    bool Memory = false;
+    unsigned Latency = 1;
+  };
+  SmallVector<Info, 64> Infos(N);
+  for (unsigned I = 0; I != N; ++I) {
+    const MCInstrDesc &Desc = MII->get(Insts[I].getOpcode());
+    unsigned NumDefs = Desc.getNumDefs();
+    for (unsigned Op = 0; Op != Insts[I].getNumOperands(); ++Op) {
+      const MCOperand &MO = Insts[I].getOperand(Op);
+      if (!MO.isReg() || MO.getReg() == X0)
+        continue;
+      if (Op < NumDefs)
+        Infos[I].Defs.push_back(MO.getReg());
+      else
+        Infos[I].Uses.push_back(MO.getReg());
+    }
+    unsigned Opc = Insts[I].getOpcode();
+    Infos[I].Memory = isAbyssLoad(Opc) || isAbyssStore(Opc);
+    if (Opc == Abyss::MUL)
+      Infos[I].Latency = 3;
+    else if (Opc == Abyss::DIV || Opc == Abyss::DIVU || Opc == Abyss::REM ||
+             Opc == Abyss::REMU)
+      Infos[I].Latency = 8;
+    else if (isAbyssLoad(Opc))
+      Infos[I].Latency = 4;
+    else if (isAbyssStore(Opc))
+      Infos[I].Latency = 2;
+  }
+
+  SmallVector<SmallVector<unsigned, 4>, 64> Succs(N);
+  SmallVector<unsigned, 64> DepCount(N, 0);
+  for (unsigned I = 0; I != N; ++I) {
+    for (unsigned J = I + 1; J != N; ++J) {
+      bool Dep = Infos[I].Memory && Infos[J].Memory;
+      for (unsigned D : Infos[I].Defs) {
+        if (Dep)
+          break;
+        for (unsigned U : Infos[J].Uses)
+          if (D == U) {
+            Dep = true;
+            break;
+          }
+        for (unsigned D2 : Infos[J].Defs)
+          if (D == D2) {
+            Dep = true;
+            break;
+          }
+      }
+      if (!Dep)
+        for (unsigned U : Infos[I].Uses)
+          for (unsigned D : Infos[J].Defs)
+            if (U == D) {
+              Dep = true;
+              break;
+            }
+      if (Dep) {
+        Succs[I].push_back(J);
+        ++DepCount[J];
+      }
+    }
+  }
+
+  SmallVector<unsigned, 64> Height(N, 0);
+  for (unsigned I = N; I-- > 0;) {
+    Height[I] = Infos[I].Latency;
+    for (unsigned J : Succs[I])
+      Height[I] = std::max(Height[I], Infos[I].Latency + Height[J]);
+  }
+
+  SmallVector<unsigned, 64> Ready;
+  for (unsigned I = 0; I != N; ++I)
+    if (!DepCount[I])
+      Ready.push_back(I);
+
+  while (!Ready.empty()) {
+    unsigned Best = 0;
+    for (unsigned I = 1; I != Ready.size(); ++I) {
+      unsigned A = Ready[I], B = Ready[Best];
+      if (Height[A] > Height[B] ||
+          (Height[A] == Height[B] && A < B))
+        Best = I;
+    }
+    unsigned I = Ready[Best];
+    Ready.erase(Ready.begin() + Best);
+    Streamer->emitInstruction(Insts[I], *STI);
+    for (unsigned J : Succs[I])
+      if (--DepCount[J] == 0)
+        Ready.push_back(J);
+  }
+}
+
+void AbyssMC::flushSchedule() {
+  if (!Scheduling)
+    return;
+  Scheduling = false;
+  scheduleAndEmit(PendingInsts);
+  PendingInsts.clear();
+}
+
 void AbyssMC::emitConst(unsigned Rd, int64_t Value) {
   uint32_t U = static_cast<uint32_t>(Value);
   int32_t S = static_cast<int32_t>(U);
@@ -226,6 +404,7 @@ void AbyssMC::emitConst(unsigned Rd, int64_t Value) {
 }
 
 unsigned AbyssMC::slotOf(const Value *V) const {
+  V = resolve(V);
   auto It = Slots.find(V);
   assert(It != Slots.end() && "value has no stack slot");
   return It->second;
@@ -236,7 +415,14 @@ int AbyssMC::slotOffset(const Value *V) const {
 }
 
 void AbyssMC::loadValue(unsigned Rd, const Value *V) {
+  V = resolve(V);
   if (auto *CI = dyn_cast<ConstantInt>(V)) {
+    auto It = PinnedConst.find(CI);
+    if (It != PinnedConst.end()) {
+      if (Rd != It->second)
+        i(Abyss::ADDI, Rd, It->second, 0);
+      return;
+    }
     emitConst(Rd, CI->getSExtValue());
     return;
   }
@@ -266,6 +452,7 @@ void AbyssMC::loadValue(unsigned Rd, const Value *V) {
 }
 
 void AbyssMC::storeSlot(const Value *V, unsigned Rs) {
+  V = resolve(V);
   auto RegIt = RegAssign.find(V);
   if (RegIt != RegAssign.end()) {
     RegLive.insert(V);
@@ -277,14 +464,20 @@ void AbyssMC::storeSlot(const Value *V, unsigned Rs) {
 }
 
 unsigned AbyssMC::destReg(const Value *V, unsigned Scratch) const {
+  V = resolve(V);
   auto It = RegAssign.find(V);
   return It == RegAssign.end() ? Scratch : It->second;
 }
 
 unsigned AbyssMC::operandReg(unsigned Scratch, const Value *V) {
-  if (auto *CI = dyn_cast<ConstantInt>(V))
+  V = resolve(V);
+  if (auto *CI = dyn_cast<ConstantInt>(V)) {
+    auto It = PinnedConst.find(CI);
+    if (It != PinnedConst.end())
+      return It->second;
     if (CI->isZero())
       return X0;
+  }
   auto It = RegAssign.find(V);
   if (It != RegAssign.end() && RegLive.count(V))
     return It->second;
@@ -296,6 +489,18 @@ void AbyssMC::beginBlockRegisters(BasicBlock &BB) {
   RegAssign.clear();
   RegLive.clear();
   BlockValues.clear();
+
+  DenseSet<unsigned> Reserved;
+  for (const Value *V : BlockPinned.lookup(&BB)) {
+    unsigned Reg = PinnedReg.lookup(V);
+    RegAssign[V] = Reg;
+    RegLive.insert(V);
+    Reserved.insert(Reg);
+  }
+  // Constant homes live from the prologue through every block of a call-free
+  // function, so they must not be reused outside the loop either.
+  for (auto &KV : PinnedConst)
+    Reserved.insert(KV.second);
 
   // Compute local live intervals.  A value starts at its definition and ends
   // at its last use in this block.  Live-out values are extended to the end so
@@ -345,7 +550,7 @@ void AbyssMC::beginBlockRegisters(BasicBlock &BB) {
       Intervals.push_back({S, E == S ? BlockEnd : E, KV.first, true});
   }
   for (auto &KV : EntryEnd)
-    if (EntryUses.lookup(KV.first) > 1)
+    if (EntryUses.lookup(KV.first) > 1 && !PinnedReg.count(KV.first))
       Intervals.push_back({0, KV.second, KV.first, false});
   llvm::sort(Intervals, [](const Interval &A, const Interval &B) {
     return A.Start < B.Start;
@@ -356,7 +561,11 @@ void AbyssMC::beginBlockRegisters(BasicBlock &BB) {
   // starts.
   DenseMap<unsigned, unsigned> RegEnd;
   for (const Interval &It : Intervals) {
+    if (PinnedReg.count(It.V))
+      continue;
     for (unsigned Reg : AbyssAllocRegs) {
+      if (Reserved.count(Reg))
+        continue;
       auto Active = RegEnd.find(Reg);
       if (Active != RegEnd.end() && Active->second >= It.Start)
         continue;
@@ -368,6 +577,108 @@ void AbyssMC::beginBlockRegisters(BasicBlock &BB) {
       break;
     }
   }
+}
+
+void AbyssMC::assignLoopRegisters(Function &F) {
+  PinnedReg.clear();
+  PinnedLoop.clear();
+  BlockPinned.clear();
+
+  LoopDT = std::make_unique<DominatorTree>(F);
+  LoopAnalysis = std::make_unique<LoopInfo>(*LoopDT);
+  LoopInfo &LI = *LoopAnalysis;
+  DenseSet<unsigned> GlobalUsed;
+  std::function<void(Loop *)> Visit = [&](Loop *L) {
+    // Pinning an outer loop while an inner loop is also pinned would reserve
+    // too many registers.  Start with innermost loops, which carry the hot
+    // induction variables in the raster kernels.
+    if (!L->getSubLoops().empty()) {
+      for (Loop *Sub : L->getSubLoops())
+        Visit(Sub);
+      return;
+    }
+
+    // Calls clobber the allocatable register set, so they are incompatible
+    // with values held live across a whole loop.
+    for (BasicBlock *B : L->blocks())
+      for (Instruction &I : *B)
+        if (auto *CB = dyn_cast<CallBase>(&I))
+          if (CB->getIntrinsicID() == Intrinsic::not_intrinsic &&
+              !isa<InlineAsm>(CB->getCalledOperand()))
+            return;
+
+    BasicBlock *Header = L->getHeader();
+    SmallVector<PHINode *, 2> Pinned;
+    for (PHINode &PN : Header->phis()) {
+      if (!PN.getType()->isIntegerTy(32) || Pinned.size() == 3)
+        continue;
+      for (unsigned Reg : AbyssAllocRegs) {
+        if (GlobalUsed.count(Reg))
+          continue;
+        GlobalUsed.insert(Reg);
+        PinnedReg[&PN] = Reg;
+        PinnedLoop[&PN] = L;
+        Pinned.push_back(&PN);
+        break;
+      }
+    }
+    for (BasicBlock *B : L->blocks())
+      for (PHINode *PN : Pinned)
+        BlockPinned[B].push_back(PN);
+
+    // Hoist a few hot loop constants.  Large constants cost LUI+ADDI on every
+    // use; keeping them in a register is a net win even after reserving the
+    // register.  Only do this in call-free functions so the homes survive from
+    // the prologue to the loop.
+    if (!FunctionHasCalls) {
+      DenseMap<const ConstantInt *, unsigned> Count, Cost;
+      for (BasicBlock *B : L->blocks())
+        for (Instruction &I : *B)
+          for (Value *Op : I.operands())
+            if (auto *CI = dyn_cast<ConstantInt>(Op)) {
+              if (CI->isZero())
+                continue;
+              ++Count[CI];
+              int64_t V = CI->getSExtValue();
+              Cost[CI] = (V >= -2048 && V <= 2047) ? 1 : 2;
+            }
+
+      SmallVector<std::pair<unsigned, const ConstantInt *>, 16> Ranked;
+      for (auto &KV : Count)
+        Ranked.push_back({KV.second * Cost.lookup(KV.first), KV.first});
+      llvm::sort(Ranked, [](const auto &A, const auto &B) {
+        if (A.first != B.first)
+          return A.first > B.first;
+        int64_t AV = A.second->getSExtValue();
+        int64_t BV = B.second->getSExtValue();
+        return AV > BV;
+      });
+
+      // Keep roughly one third of the register file free for temporaries.
+      constexpr unsigned MaxPinnedRegs = 14;
+      for (auto &Entry : Ranked) {
+        if (GlobalUsed.size() >= MaxPinnedRegs)
+          break;
+        const ConstantInt *CI = Entry.second;
+        if (PinnedConst.count(CI) || CI->isOne() || CI->isMinusOne())
+          continue;
+        unsigned Reg = 0;
+        for (unsigned Candidate : AbyssAllocRegs) {
+          if (!GlobalUsed.count(Candidate)) {
+            Reg = Candidate;
+            break;
+          }
+        }
+        if (!Reg)
+          break;
+        GlobalUsed.insert(Reg);
+        PinnedConst[CI] = Reg;
+      }
+    }
+  };
+
+  for (Loop *L : LI)
+    Visit(L);
 }
 
 void AbyssMC::flushBlockValues(bool Force) {
@@ -399,6 +710,13 @@ void AbyssMC::emit() {
 void AbyssMC::emitFunction(Function &F) {
   Slots.clear();
   AllocaOffsets.clear();
+  Aliases.clear();
+  PinnedReg.clear();
+  PinnedLoop.clear();
+  BlockPinned.clear();
+  PinnedConst.clear();
+  LoopDT.reset();
+  LoopAnalysis.reset();
   BlockNames.clear();
   NeedsSlot.clear();
   NeedOwnSlot.clear();
@@ -408,6 +726,13 @@ void AbyssMC::emitFunction(Function &F) {
   NextSlot = 1; // slot 0 is the saved return address
   NextLabel = 0;
   FnName = F.getName().str();
+  FunctionHasCalls = false;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (CB->getIntrinsicID() == Intrinsic::not_intrinsic &&
+            !isa<InlineAsm>(CB->getCalledOperand()))
+          FunctionHasCalls = true;
 
   for (Argument &A : F.args())
     Slots[&A] = NextSlot++;
@@ -462,6 +787,7 @@ void AbyssMC::emitFunction(Function &F) {
       AllocaOffsets[AI] = -Used;
     }
   CurFrameSize = alignTo(Used, 16);
+  assignLoopRegisters(F);
   MCSymbol *FnSym = Ctx->getOrCreateSymbol(FnName);
   // Keep assembly symbols local: the test flow concatenates start.s and the
   // kernel before assembling, and a global symbol would make the assembler
@@ -508,6 +834,11 @@ void AbyssMC::emitFunction(Function &F) {
     storeSlot(KV.first, T0);
   }
 
+  // Constant homes are loaded once in the prologue and never clobbered in a
+  // call-free function.
+  for (auto &KV : PinnedConst)
+    emitConst(KV.second, KV.first->getSExtValue());
+
   for (BasicBlock &BB : F)
     emitBlock(F, BB);
 }
@@ -515,6 +846,7 @@ void AbyssMC::emitFunction(Function &F) {
 void AbyssMC::emitBlock(Function &F, BasicBlock &BB) {
   Streamer->emitLabel(blockSymbol(&BB));
   beginBlockRegisters(BB);
+  beginSchedule();
   // A conditional branch materializes its own operands.  Do not also emit the
   // ICmp as a value: that produced a second SLT plus a second copy of the
   // comparison constants on every loop iteration.
@@ -527,6 +859,7 @@ void AbyssMC::emitBlock(Function &F, BasicBlock &BB) {
 
   for (Instruction &I : BB) {
     if (I.isTerminator()) {
+      flushSchedule();
       flushBlockValues(/*Force=*/false);
       emitTerminator(F, BB, I);
       break;
@@ -555,6 +888,48 @@ void AbyssMC::emitCopy(Instruction &I, const Value *V) {
   unsigned D = destReg(&I, T0);
   loadValue(D, V);
   storeSlot(&I, D);
+}
+
+bool AbyssMC::emitPinnedPhiUpdate(BinaryOperator &BO, BasicBlock &BB) {
+  if (BO.getOpcode() != Instruction::Add &&
+      BO.getOpcode() != Instruction::Sub)
+    return false;
+  if (!BO.hasOneUse())
+    return false;
+  auto *PN = dyn_cast<PHINode>(*BO.user_begin());
+  if (!PN || !PinnedReg.count(PN))
+    return false;
+  if (PN->getIncomingValueForBlock(&BB) != &BO)
+    return false;
+
+  auto *C0 = dyn_cast<ConstantInt>(BO.getOperand(0));
+  auto *C1 = dyn_cast<ConstantInt>(BO.getOperand(1));
+  const Value *Base = nullptr;
+  int64_t Delta = 0;
+  if (C1) {
+    Base = BO.getOperand(0);
+    Delta = C1->getSExtValue();
+    if (BO.getOpcode() == Instruction::Sub)
+      Delta = -Delta;
+  } else if (C0 && BO.getOpcode() == Instruction::Add) {
+    Base = BO.getOperand(1);
+    Delta = C0->getSExtValue();
+  } else {
+    return false;
+  }
+  if (resolve(Base) != PN)
+    return false;
+
+  unsigned Reg = PinnedReg.lookup(PN);
+  if (Delta >= -2048 && Delta <= 2047) {
+    i(Abyss::ADDI, Reg, Reg, Delta);
+  } else {
+    emitConst(T0, Delta);
+    r(Abyss::ADD, Reg, Reg, T0);
+  }
+  // The update is now the new PHI value; no separate SSA value or spill.
+  Aliases[&BO] = PN;
+  return true;
 }
 
 void AbyssMC::emitBinary(BinaryOperator &BO) {
@@ -661,14 +1036,17 @@ void AbyssMC::emitBinary(BinaryOperator &BO) {
   case Instruction::URem: {
     bool IsRem = BO.getOpcode() == Instruction::SRem ||
                  BO.getOpcode() == Instruction::URem;
+    bool IsSigned = BO.getOpcode() == Instruction::SDiv ||
+                    BO.getOpcode() == Instruction::SRem;
     int64_t Div = C1 ? C1->getSExtValue() : 0;
-    //
-    // Only unsigned division is strength-reduced.  Signed division needs a
-    // sign correction (SRAI/AND/ADD/SRAI), which is slower than the single
-    // DIV instruction on Abyss; keep the native DIV for SDiv/SRem.
-    //
-    if (BO.getOpcode() == Instruction::UDiv ||
-        BO.getOpcode() == Instruction::URem) {
+    // Unsigned division is always strength-reduced.  Signed division normally
+    // keeps native DIV (the sign-correction sequence is slower on Abyss), but
+    // a known-non-negative numerator has exactly the unsigned semantics.
+    bool NonNegative =
+        !IsSigned ||
+        computeKnownBits(BO.getOperand(0), M.getDataLayout(), nullptr, &BO)
+            .isNonNegative();
+    if (!IsSigned || NonNegative) {
       if (Div > 0 && isPowerOf2_64(static_cast<uint64_t>(Div))) {
         unsigned K = Log2_64(static_cast<uint64_t>(Div));
         uint64_t Mask = static_cast<uint64_t>(Div) - 1;
@@ -1086,12 +1464,15 @@ void AbyssMC::emitCall(CallInst &CI, BasicBlock &BB) {
   }
 
   // Calls may clobber every allocatable register, so spill live block-local
-  // values before the call and reload them lazily afterwards.
+  // values before the call and reload them lazily afterwards.  They are also
+  // scheduling barriers.
+  flushSchedule();
   flushBlockValues(/*Force=*/true);
   MCSymbol *CalleeSym = Ctx->getOrCreateSymbol(Callee->getName());
   jal(RA, CalleeSym);
   if (!CI.getType()->isVoidTy())
     storeSlot(&CI, A0);
+  beginSchedule();
 }
 
 void AbyssMC::emitInstruction(Function &F, BasicBlock &BB, Instruction &I) {
@@ -1100,6 +1481,8 @@ void AbyssMC::emitInstruction(Function &F, BasicBlock &BB, Instruction &I) {
   if (isa<PHINode>(I))
     return;
   if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+    if (emitPinnedPhiUpdate(*BO, BB))
+      return;
     emitBinary(*BO);
     return;
   }
@@ -1128,7 +1511,8 @@ void AbyssMC::emitInstruction(Function &F, BasicBlock &BB, Instruction &I) {
     return;
   }
   if (auto *FI = dyn_cast<FreezeInst>(&I)) {
-    emitCopy(I, FI->getOperand(0));
+    // freeze of a defined integer is just an SSA rename for this target.
+    Aliases[&I] = resolve(FI->getOperand(0));
     return;
   }
   if (auto *Cast = dyn_cast<CastInst>(&I)) {
@@ -1186,14 +1570,48 @@ void AbyssMC::emitBranchPred(CmpInst::Predicate Pred, unsigned L, unsigned R,
 }
 
 void AbyssMC::emitPhiStores(BasicBlock *Pred, BasicBlock *Succ) {
+  struct PinnedMove {
+    PHINode *PN;
+    unsigned Reg;
+    const Value *In;
+  };
+  SmallVector<PinnedMove, 2> Moves;
+
+  // First store every non-pinned PHI.  A pinned move can clobber a register
+  // that still holds another PHI's incoming value, so it must run afterwards.
   for (PHINode &PN : Succ->phis()) {
-    Value *In = PN.getIncomingValueForBlock(Pred);
+    const Value *In = PN.getIncomingValueForBlock(Pred);
     if (!In)
       continue;
+    In = resolve(In);
+
+    auto PinIt = PinnedReg.find(&PN);
+    if (PinIt != PinnedReg.end()) {
+      Moves.push_back({&PN, PinIt->second, In});
+      continue;
+    }
+
     loadValue(T0, In);
     // PHI values are block-entry values: the target block always reloads them
     // from their stack slot, even if they are cached in a register here.
     s(Abyss::STR, SP, T0, slotOffset(&PN));
+  }
+
+  // Load all pinned sources into stable scratch registers before any move can
+  // overwrite another pinned destination.
+  for (unsigned I = 0; I != Moves.size(); ++I)
+    if (Moves[I].In != Moves[I].PN)
+      loadValue(T1 + I, Moves[I].In);
+
+  for (unsigned I = 0; I != Moves.size(); ++I) {
+    PinnedMove &M = Moves[I];
+    if (M.In != M.PN)
+      i(Abyss::ADDI, M.Reg, T1 + I, 0);
+    // The value stays live in M.Reg inside the loop.  Only an edge leaving
+    // the loop needs the stack slot for later readers.
+    const Loop *L = PinnedLoop.lookup(M.PN);
+    if (!L || !L->contains(Succ))
+      s(Abyss::STR, SP, M.Reg, slotOffset(M.PN));
   }
 }
 
@@ -1209,8 +1627,14 @@ void AbyssMC::emitTerminator(Function &F, BasicBlock &BB, Instruction &I) {
   }
 
   if (auto *BI = dyn_cast<BranchInst>(&I)) {
+    auto HasPhi = [](const BasicBlock *B) { return !B->phis().empty(); };
+
     if (BI->isUnconditional()) {
       BasicBlock *Succ = BI->getSuccessor(0);
+      if (!HasPhi(Succ)) {
+        jal(X0, blockSymbol(Succ));
+        return;
+      }
       MCSymbol *Edge = newLabel(&BB, "edge.u");
       jal(X0, Edge);
       Streamer->emitLabel(Edge);
@@ -1221,26 +1645,42 @@ void AbyssMC::emitTerminator(Function &F, BasicBlock &BB, Instruction &I) {
 
     BasicBlock *TrueBB = BI->getSuccessor(0);
     BasicBlock *FalseBB = BI->getSuccessor(1);
-    MCSymbol *TrueEdge = newLabel(&BB, "edge.t");
-    MCSymbol *FalseEdge = newLabel(&BB, "edge.f");
+    if (TrueBB == FalseBB) {
+      jal(X0, blockSymbol(TrueBB));
+      return;
+    }
+
+    // Branch away on the false condition and fall through into the true
+    // successor.  This removes the unconditional jump that used to sit between
+    // the branch and the true edge.  When a successor has no PHI, branch to
+    // its block directly instead of creating a one-instruction trampoline.
+    bool TruePhi = HasPhi(TrueBB);
+    bool FalsePhi = HasPhi(FalseBB);
+    MCSymbol *TrueEdge = TruePhi ? newLabel(&BB, "edge.t") : nullptr;
+    MCSymbol *FalseEdge = FalsePhi ? newLabel(&BB, "edge.f") : nullptr;
+    MCSymbol *FalseTarget = FalsePhi ? FalseEdge : blockSymbol(FalseBB);
 
     if (auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition())) {
       unsigned L = operandReg(T0, Cmp->getOperand(0));
       unsigned R = operandReg(T1, Cmp->getOperand(1));
-      emitBranchPred(Cmp->getPredicate(), L, R, TrueEdge);
+      emitBranchPred(CmpInst::getInversePredicate(Cmp->getPredicate()), L, R,
+                     FalseTarget);
     } else {
       loadValue(T0, BI->getCondition());
-      b(Abyss::BNE, T0, X0, TrueEdge);
+      b(Abyss::BEQ, T0, X0, FalseTarget);
     }
-    jal(X0, FalseEdge);
 
-    Streamer->emitLabel(TrueEdge);
-    emitPhiStores(&BB, TrueBB);
+    if (TruePhi) {
+      Streamer->emitLabel(TrueEdge);
+      emitPhiStores(&BB, TrueBB);
+    }
     jal(X0, blockSymbol(TrueBB));
 
-    Streamer->emitLabel(FalseEdge);
-    emitPhiStores(&BB, FalseBB);
-    jal(X0, blockSymbol(FalseBB));
+    if (FalsePhi) {
+      Streamer->emitLabel(FalseEdge);
+      emitPhiStores(&BB, FalseBB);
+      jal(X0, blockSymbol(FalseBB));
+    }
     return;
   }
 
