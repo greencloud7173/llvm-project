@@ -31,7 +31,7 @@ def Imm21 : Operand<i32> {
 }
 
 //===----------------------------------------------------------------------===//
-// R-type: ADD SUB MUL DIV DIVU REM REMU SLL SRL SRA
+// R-type: ADD SUB MUL DIV DIVU REM REMU SLT SLTU AND OR XOR SLL SRL SRA
 //===----------------------------------------------------------------------===//
 def ADD : RType<0b0110011, 0b000, 0b0000000,
                 (outs XRegs:$rd), (ins XRegs:$rs1, XRegs:$rs2),
@@ -69,9 +69,19 @@ def SLT : RType<0b0110011, 0b010, 0b0000000,
 def SLTU : RType<0b0110011, 0b011, 0b0000000,
                  (outs XRegs:$rd), (ins XRegs:$rs1, XRegs:$rs2),
                  "sltu $rd, $rs1, $rs2">;
+def AND : RType<0b0110011, 0b111, 0b0000000,
+                (outs XRegs:$rd), (ins XRegs:$rs1, XRegs:$rs2),
+                "and $rd, $rs1, $rs2">;
+def OR : RType<0b0110011, 0b110, 0b0000000,
+               (outs XRegs:$rd), (ins XRegs:$rs1, XRegs:$rs2),
+               "or $rd, $rs1, $rs2">;
+def XOR : RType<0b0110011, 0b100, 0b0000000,
+                (outs XRegs:$rd), (ins XRegs:$rs1, XRegs:$rs2),
+                "xor $rd, $rs1, $rs2">;
 
 //===----------------------------------------------------------------------===//
-// I-type: ADDI LDR LB LH LBU LHU SLLI SRLI SRAI; S-type: STR SB SH
+// I-type: ADDI SLTI SLTIU ANDI ORI XORI LDR LB LH LBU LHU SLLI SRLI SRAI;
+// S-type: STR SB SH
 //===----------------------------------------------------------------------===//
 def ADDI : IType<0b0010011, 0b000,
                  (outs XRegs:$rd), (ins XRegs:$rs1, Imm12:$imm),
@@ -82,6 +92,15 @@ def SLTI : IType<0b0010011, 0b010,
 def SLTIU : IType<0b0010011, 0b011,
                   (outs XRegs:$rd), (ins XRegs:$rs1, Imm12:$imm),
                   "sltiu $rd, $rs1, #$imm">;
+def ANDI : IType<0b0010011, 0b111,
+                 (outs XRegs:$rd), (ins XRegs:$rs1, Imm12:$imm),
+                 "andi $rd, $rs1, #$imm">;
+def ORI : IType<0b0010011, 0b110,
+                (outs XRegs:$rd), (ins XRegs:$rs1, Imm12:$imm),
+                "ori $rd, $rs1, #$imm">;
+def XORI : IType<0b0010011, 0b100,
+                 (outs XRegs:$rd), (ins XRegs:$rs1, Imm12:$imm),
+                 "xori $rd, $rs1, #$imm">;
 def SLLI : ShiftIType<0b0010011, 0b001, 0b0000000,
                       (outs XRegs:$rd), (ins XRegs:$rs1, Imm5:$shamt),
                       "slli $rd, $rs1, $shamt">;
