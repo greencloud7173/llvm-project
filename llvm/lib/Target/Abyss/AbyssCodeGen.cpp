@@ -2,15 +2,17 @@
 //
 // The Abyss MC layer is complete; this file adds a deliberately small code
 // generator that lowers the integer subset used by the Abyss C tests directly
-// from LLVM IR to Abyss MCInsts.  Every SSA value lives in a stack slot, so no
-// register allocator is required.  This is enough for the matrix add/multiply
-// kernels and keeps the ABYSS-only build small.
+// from LLVM IR to Abyss MCInsts.  Values get stack slots for cross-block
+// liveness; a block-local register allocator keeps values used inside a block
+// in registers and removes most spill/reload traffic.
 //
 //===----------------------------------------------------------------------===//
 
 #include "AbyssTargetMachineImpl.h"
 #include "MCTargetDesc/AbyssMCTargetDesc.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
@@ -48,6 +50,16 @@ using namespace llvm;
 
 namespace {
 
+// Registers available to the simple block-local register allocator.  X0 is
+// hardwired zero, X1/X2 are RA/SP, X5-X9 are the emitter's scratch registers,
+// X10 is A0, and X29-X31 are the read-only thread coordinates.
+static const unsigned AbyssAllocRegs[] = {
+    Abyss::X3,  Abyss::X4,  Abyss::X11, Abyss::X12, Abyss::X13,
+    Abyss::X14, Abyss::X15, Abyss::X16, Abyss::X17, Abyss::X18,
+    Abyss::X19, Abyss::X20, Abyss::X21, Abyss::X22, Abyss::X23,
+    Abyss::X24, Abyss::X25, Abyss::X26, Abyss::X27, Abyss::X28,
+};
+
 class AbyssMC {
   Module &M;
   const Target &T;
@@ -66,6 +78,11 @@ class AbyssMC {
   DenseMap<const Value *, unsigned> Slots;
   DenseMap<const AllocaInst *, int> AllocaOffsets;
   DenseMap<const BasicBlock *, std::string> BlockNames;
+  DenseSet<const Value *> NeedsSlot;
+  DenseSet<const Value *> NeedOwnSlot;
+  DenseMap<const Value *, unsigned> RegAssign;
+  DenseSet<const Value *> RegLive;
+  SmallVector<const Value *, 32> BlockValues;
   std::string FnName;
   unsigned NextSlot = 0;
   unsigned NextLabel = 0;
@@ -122,6 +139,10 @@ private:
   void emitConst(unsigned Rd, int64_t Value);
   void loadValue(unsigned Rd, const Value *V);
   void storeSlot(const Value *V, unsigned Rs);
+  unsigned destReg(const Value *V, unsigned Scratch) const;
+  unsigned operandReg(unsigned Scratch, const Value *V);
+  void beginBlockRegisters(BasicBlock &BB);
+  void flushBlockValues(bool Force);
   unsigned slotOf(const Value *V) const;
   int slotOffset(const Value *V) const;
 
@@ -231,11 +252,130 @@ void AbyssMC::loadValue(unsigned Rd, const Value *V) {
       return;
     }
   }
+  auto RegIt = RegAssign.find(V);
+  if (RegIt != RegAssign.end()) {
+    if (!RegLive.count(V)) {
+      i(Abyss::LDR, RegIt->second, SP, slotOffset(V));
+      RegLive.insert(V);
+    }
+    if (Rd != RegIt->second)
+      i(Abyss::ADDI, Rd, RegIt->second, 0);
+    return;
+  }
   i(Abyss::LDR, Rd, SP, slotOffset(V));
 }
 
 void AbyssMC::storeSlot(const Value *V, unsigned Rs) {
+  auto RegIt = RegAssign.find(V);
+  if (RegIt != RegAssign.end()) {
+    RegLive.insert(V);
+    if (Rs != RegIt->second)
+      i(Abyss::ADDI, RegIt->second, Rs, 0);
+    return;
+  }
   s(Abyss::STR, SP, Rs, slotOffset(V));
+}
+
+unsigned AbyssMC::destReg(const Value *V, unsigned Scratch) const {
+  auto It = RegAssign.find(V);
+  return It == RegAssign.end() ? Scratch : It->second;
+}
+
+unsigned AbyssMC::operandReg(unsigned Scratch, const Value *V) {
+  auto It = RegAssign.find(V);
+  if (It != RegAssign.end() && RegLive.count(V))
+    return It->second;
+  loadValue(Scratch, V);
+  return Scratch;
+}
+
+void AbyssMC::beginBlockRegisters(BasicBlock &BB) {
+  RegAssign.clear();
+  RegLive.clear();
+  BlockValues.clear();
+
+  // Compute local live intervals.  A value starts at its definition and ends
+  // at its last use in this block.  Live-out values are extended to the end so
+  // they can be stored once, after all in-block uses.
+  DenseMap<const Value *, unsigned> Start, End;
+  DenseMap<const Value *, unsigned> EntryUses, EntryEnd;
+  unsigned Index = 0;
+  for (Instruction &I : BB) {
+    if (!I.getType()->isVoidTy() && !isa<PHINode>(I) &&
+        !isa<AllocaInst>(I) &&
+        (I.getType()->isIntegerTy() || I.getType()->isPointerTy())) {
+      Start[&I] = Index;
+      End[&I] = Index;
+    }
+    for (Value *Op : I.operands()) {
+      auto It = End.find(Op);
+      if (It != End.end() && Index > It->second)
+        It->second = Index;
+
+      // Cache frequently used values defined outside this block (loop-carried
+      // PHIs, pointers, arguments) in a register on first use.
+      if (It == End.end() && !isa<Constant>(Op) &&
+          (Op->getType()->isIntegerTy() || Op->getType()->isPointerTy())) {
+        ++EntryUses[Op];
+        EntryEnd[Op] = Index;
+      }
+    }
+    ++Index;
+  }
+
+  unsigned BlockEnd = Index;
+  for (auto &KV : End)
+    if (NeedsSlot.count(KV.first) && KV.second > Start.lookup(KV.first))
+      KV.second = BlockEnd;
+
+  struct Interval {
+    unsigned Start;
+    unsigned End;
+    const Value *V;
+    bool Local;
+  };
+  SmallVector<Interval, 32> Intervals;
+  for (auto &KV : Start) {
+    unsigned S = KV.second;
+    unsigned E = End.lookup(KV.first);
+    if (E > S || NeedsSlot.count(KV.first))
+      Intervals.push_back({S, E == S ? BlockEnd : E, KV.first, true});
+  }
+  for (auto &KV : EntryEnd)
+    if (EntryUses.lookup(KV.first) > 1)
+      Intervals.push_back({0, KV.second, KV.first, false});
+  llvm::sort(Intervals, [](const Interval &A, const Interval &B) {
+    return A.Start < B.Start;
+  });
+
+  // Classic linear scan over a small fixed register set.  A register can be
+  // reused once its previous interval has ended before the new interval
+  // starts.
+  DenseMap<unsigned, unsigned> RegEnd;
+  for (const Interval &It : Intervals) {
+    for (unsigned Reg : AbyssAllocRegs) {
+      auto Active = RegEnd.find(Reg);
+      if (Active != RegEnd.end() && Active->second >= It.Start)
+        continue;
+
+      RegAssign[It.V] = Reg;
+      RegEnd[Reg] = It.End;
+      if (It.Local)
+        BlockValues.push_back(It.V);
+      break;
+    }
+  }
+}
+
+void AbyssMC::flushBlockValues(bool Force) {
+  for (const Value *V : BlockValues) {
+    if (!RegLive.count(V))
+      continue;
+    if (Force || NeedOwnSlot.count(V))
+      s(Abyss::STR, SP, RegAssign[V], slotOffset(V));
+  }
+  if (Force)
+    RegLive.clear();
 }
 
 MCSymbol *AbyssMC::newLabel(const BasicBlock *BB, StringRef Suffix) {
@@ -257,6 +397,11 @@ void AbyssMC::emitFunction(Function &F) {
   Slots.clear();
   AllocaOffsets.clear();
   BlockNames.clear();
+  NeedsSlot.clear();
+  NeedOwnSlot.clear();
+  RegAssign.clear();
+  RegLive.clear();
+  BlockValues.clear();
   NextSlot = 1; // slot 0 is the saved return address
   NextLabel = 0;
   FnName = F.getName().str();
@@ -268,6 +413,27 @@ void AbyssMC::emitFunction(Function &F) {
     for (Instruction &I : BB)
       if (isa<PHINode>(I) || !I.getType()->isVoidTy())
         Slots[&I] = NextSlot++;
+
+  // A value that is only used inside its defining block can stay in a
+  // register.  Values with a cross-block use must be visible in their stack
+  // slot at the end of the defining block.
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB) {
+      if (I.getType()->isVoidTy() || isa<PHINode>(I) || isa<AllocaInst>(I))
+        continue;
+      bool CrossesBlock = false;
+      for (User *U : I.users()) {
+        auto *UI = dyn_cast<Instruction>(U);
+        if (!UI || UI->getParent() != &BB) {
+          CrossesBlock = true;
+          // A PHI edge can read the register directly in emitPhiStores.
+          if (!isa<PHINode>(U))
+            NeedOwnSlot.insert(&I);
+        }
+      }
+      if (CrossesBlock)
+        NeedsSlot.insert(&I);
+    }
 
   unsigned BI = 0;
   for (BasicBlock &BB : F) {
@@ -345,8 +511,10 @@ void AbyssMC::emitFunction(Function &F) {
 
 void AbyssMC::emitBlock(Function &F, BasicBlock &BB) {
   Streamer->emitLabel(blockSymbol(&BB));
+  beginBlockRegisters(BB);
   for (Instruction &I : BB) {
     if (I.isTerminator()) {
+      flushBlockValues(/*Force=*/false);
       emitTerminator(F, BB, I);
       break;
     }
@@ -369,105 +537,108 @@ void AbyssMC::restoreStackPointer() {
 }
 
 void AbyssMC::emitCopy(Instruction &I, const Value *V) {
-  loadValue(T0, V);
-  storeSlot(&I, T0);
+  unsigned D = destReg(&I, T0);
+  loadValue(D, V);
+  storeSlot(&I, D);
 }
 
 void AbyssMC::emitBinary(BinaryOperator &BO) {
-  loadValue(T0, BO.getOperand(0));
-  loadValue(T1, BO.getOperand(1));
+  unsigned L = operandReg(T0, BO.getOperand(0));
+  unsigned R = operandReg(T1, BO.getOperand(1));
+  unsigned D = destReg(&BO, T2);
 
   switch (BO.getOpcode()) {
   case Instruction::Add:
-    r(Abyss::ADD, T2, T0, T1);
+    r(Abyss::ADD, D, L, R);
     break;
   case Instruction::Sub:
-    r(Abyss::SUB, T2, T0, T1);
+    r(Abyss::SUB, D, L, R);
     break;
   case Instruction::Mul:
-    r(Abyss::MUL, T2, T0, T1);
+    r(Abyss::MUL, D, L, R);
     break;
   case Instruction::And:
-    r(Abyss::AND, T2, T0, T1);
+    r(Abyss::AND, D, L, R);
     break;
   case Instruction::Or:
-    r(Abyss::OR, T2, T0, T1);
+    r(Abyss::OR, D, L, R);
     break;
   case Instruction::Xor:
-    r(Abyss::XOR, T2, T0, T1);
+    r(Abyss::XOR, D, L, R);
     break;
   case Instruction::Shl:
-    r(Abyss::SLL, T2, T0, T1);
+    r(Abyss::SLL, D, L, R);
     break;
   case Instruction::LShr:
-    r(Abyss::SRL, T2, T0, T1);
+    r(Abyss::SRL, D, L, R);
     break;
   case Instruction::AShr:
-    r(Abyss::SRA, T2, T0, T1);
+    r(Abyss::SRA, D, L, R);
     break;
   case Instruction::SDiv:
-    r(Abyss::DIV, T2, T0, T1);
+    r(Abyss::DIV, D, L, R);
     break;
   case Instruction::SRem:
-    r(Abyss::REM, T2, T0, T1);
+    r(Abyss::REM, D, L, R);
     break;
   case Instruction::UDiv:
-    r(Abyss::DIVU, T2, T0, T1);
+    r(Abyss::DIVU, D, L, R);
     break;
   case Instruction::URem:
-    r(Abyss::REMU, T2, T0, T1);
+    r(Abyss::REMU, D, L, R);
     break;
   default:
     report_fatal_error("Abyss: unsupported binary operator");
   }
-  storeSlot(&BO, T2);
+  storeSlot(&BO, D);
 }
 
 void AbyssMC::emitICmp(ICmpInst &CI) {
-  loadValue(T0, CI.getOperand(0));
-  loadValue(T1, CI.getOperand(1));
+  unsigned L = operandReg(T0, CI.getOperand(0));
+  unsigned R = operandReg(T1, CI.getOperand(1));
+  unsigned D = destReg(&CI, T2);
 
   switch (CI.getPredicate()) {
   case CmpInst::ICMP_EQ:
-    r(Abyss::XOR, T2, T0, T1);
-    i(Abyss::SLTIU, T2, T2, 1);
+    r(Abyss::XOR, D, L, R);
+    i(Abyss::SLTIU, D, D, 1);
     break;
   case CmpInst::ICMP_NE:
-    r(Abyss::XOR, T2, T0, T1);
-    r(Abyss::SLTU, T2, X0, T2);
+    r(Abyss::XOR, D, L, R);
+    r(Abyss::SLTU, D, X0, D);
     break;
   case CmpInst::ICMP_SLT:
-    r(Abyss::SLT, T2, T0, T1);
+    r(Abyss::SLT, D, L, R);
     break;
   case CmpInst::ICMP_SGT:
-    r(Abyss::SLT, T2, T1, T0);
+    r(Abyss::SLT, D, R, L);
     break;
   case CmpInst::ICMP_SLE:
-    r(Abyss::SLT, T2, T1, T0);
-    i(Abyss::XORI, T2, T2, 1);
+    r(Abyss::SLT, D, R, L);
+    i(Abyss::XORI, D, D, 1);
     break;
   case CmpInst::ICMP_SGE:
-    r(Abyss::SLT, T2, T0, T1);
-    i(Abyss::XORI, T2, T2, 1);
+    r(Abyss::SLT, D, L, R);
+    i(Abyss::XORI, D, D, 1);
     break;
   case CmpInst::ICMP_ULT:
-    r(Abyss::SLTU, T2, T0, T1);
+    r(Abyss::SLTU, D, L, R);
     break;
   case CmpInst::ICMP_UGT:
-    r(Abyss::SLTU, T2, T1, T0);
+    r(Abyss::SLTU, D, R, L);
     break;
   case CmpInst::ICMP_ULE:
-    r(Abyss::SLTU, T2, T1, T0);
-    i(Abyss::XORI, T2, T2, 1);
+    r(Abyss::SLTU, D, R, L);
+    i(Abyss::XORI, D, D, 1);
     break;
   case CmpInst::ICMP_UGE:
-    r(Abyss::SLTU, T2, T0, T1);
-    i(Abyss::XORI, T2, T2, 1);
+    r(Abyss::SLTU, D, L, R);
+    i(Abyss::XORI, D, D, 1);
     break;
   default:
     report_fatal_error("Abyss: unsupported icmp predicate");
   }
-  storeSlot(&CI, T2);
+  storeSlot(&CI, D);
 }
 
 void AbyssMC::emitGEP(GetElementPtrInst &GEP) {
@@ -523,7 +694,7 @@ void AbyssMC::emitGEP(GetElementPtrInst &GEP) {
 }
 
 void AbyssMC::emitLoad(LoadInst &LI) {
-  loadValue(T0, LI.getPointerOperand());
+  unsigned P = operandReg(T0, LI.getPointerOperand());
   Type *Ty = LI.getType();
   bool IsUnsigned = false;
   for (User *U : LI.users())
@@ -539,8 +710,9 @@ void AbyssMC::emitLoad(LoadInst &LI) {
     Op = IsUnsigned ? Abyss::LHU : Abyss::LH;
   else if (!Ty->isIntegerTy(32))
     report_fatal_error("Abyss: unsupported load type");
-  i(Op, T2, T0, 0);
-  storeSlot(&LI, T2);
+  unsigned D = destReg(&LI, T2);
+  i(Op, D, P, 0);
+  storeSlot(&LI, D);
 }
 
 void AbyssMC::emitStore(StoreInst &SI) {
@@ -555,9 +727,9 @@ void AbyssMC::emitStore(StoreInst &SI) {
   else if (!Ty->isIntegerTy(32))
     report_fatal_error("Abyss: unsupported store type");
 
-  loadValue(T0, SI.getValueOperand());
-  loadValue(T1, SI.getPointerOperand());
-  s(Op, T1, T0, 0);
+  unsigned V = operandReg(T0, SI.getValueOperand());
+  unsigned P = operandReg(T1, SI.getPointerOperand());
+  s(Op, P, V, 0);
 }
 
 void AbyssMC::emitSelect(BasicBlock &BB, SelectInst &SI) {
@@ -571,13 +743,14 @@ void AbyssMC::emitSelect(BasicBlock &BB, SelectInst &SI) {
   r(Abyss::SLTU, T0, X0, T0);
   r(Abyss::SUB, T0, X0, T0);
 
-  loadValue(T1, SI.getTrueValue());
-  loadValue(T2, SI.getFalseValue());
-  r(Abyss::AND, T3, T1, T0);
+  unsigned TV = operandReg(T1, SI.getTrueValue());
+  unsigned FV = operandReg(T2, SI.getFalseValue());
+  r(Abyss::AND, T3, TV, T0);
   i(Abyss::XORI, T4, T0, -1);
-  r(Abyss::AND, T2, T2, T4);
-  r(Abyss::OR, T3, T3, T2);
-  storeSlot(&SI, T3);
+  r(Abyss::AND, T1, FV, T4);
+  unsigned D = destReg(&SI, T3);
+  r(Abyss::OR, D, T3, T1);
+  storeSlot(&SI, D);
 }
 
 void AbyssMC::emitMinMax(CallInst &CI, BasicBlock &, bool IsMin,
@@ -598,8 +771,9 @@ void AbyssMC::emitMinMax(CallInst &CI, BasicBlock &, bool IsMin,
   r(Abyss::AND, T3, T0, T2);
   i(Abyss::XORI, T4, T2, -1);
   r(Abyss::AND, T1, T1, T4);
-  r(Abyss::OR, T3, T3, T1);
-  storeSlot(&CI, T3);
+  unsigned D = destReg(&CI, T3);
+  r(Abyss::OR, D, T3, T1);
+  storeSlot(&CI, D);
 }
 
 void AbyssMC::emitCall(CallInst &CI, BasicBlock &BB) {
@@ -655,6 +829,9 @@ void AbyssMC::emitCall(CallInst &CI, BasicBlock &BB) {
     ++ArgNo;
   }
 
+  // Calls may clobber every allocatable register, so spill live block-local
+  // values before the call and reload them lazily afterwards.
+  flushBlockValues(/*Force=*/true);
   MCSymbol *CalleeSym = Ctx->getOrCreateSymbol(Callee->getName());
   jal(RA, CalleeSym);
   if (!CI.getType()->isVoidTy())
@@ -758,7 +935,9 @@ void AbyssMC::emitPhiStores(BasicBlock *Pred, BasicBlock *Succ) {
     if (!In)
       continue;
     loadValue(T0, In);
-    storeSlot(&PN, T0);
+    // PHI values are block-entry values: the target block always reloads them
+    // from their stack slot, even if they are cached in a register here.
+    s(Abyss::STR, SP, T0, slotOffset(&PN));
   }
 }
 
