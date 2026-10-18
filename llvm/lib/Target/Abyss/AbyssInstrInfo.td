@@ -56,7 +56,7 @@ def SRA : RType<0b0110011, 0b101, 0b0100000,
                 "sra $rd, $rs1, $rs2">;
 
 //===----------------------------------------------------------------------===//
-// I-type: ADDI LDR SLLI SRLI SRAI; S-type: STR
+// I-type: ADDI LDR LB LH LBU LHU SLLI SRLI SRAI; S-type: STR SB SH
 //===----------------------------------------------------------------------===//
 def ADDI : IType<0b0010011, 0b000,
                  (outs XRegs:$rd), (ins XRegs:$rs1, Imm12:$imm),
@@ -73,9 +73,27 @@ def SRAI : ShiftIType<0b0010011, 0b101, 0b0100000,
 def LDR  : IType<0b0000011, 0b010,
                  (outs XRegs:$rd), (ins XRegs:$rs1, Imm12:$imm),
                  "ldr $rd, ${imm}(${rs1})">;
+def LB   : IType<0b0000011, 0b000,
+                 (outs XRegs:$rd), (ins XRegs:$rs1, Imm12:$imm),
+                 "lb $rd, ${imm}(${rs1})">;
+def LH   : IType<0b0000011, 0b001,
+                 (outs XRegs:$rd), (ins XRegs:$rs1, Imm12:$imm),
+                 "lh $rd, ${imm}(${rs1})">;
+def LBU  : IType<0b0000011, 0b100,
+                 (outs XRegs:$rd), (ins XRegs:$rs1, Imm12:$imm),
+                 "lbu $rd, ${imm}(${rs1})">;
+def LHU  : IType<0b0000011, 0b101,
+                 (outs XRegs:$rd), (ins XRegs:$rs1, Imm12:$imm),
+                 "lhu $rd, ${imm}(${rs1})">;
 def STR  : SType<0b0100011, 0b010,
                  (outs), (ins XRegs:$rs1, XRegs:$rs2, Imm12:$imm),
                  "str $rs2, ${imm}(${rs1})">;
+def SB   : SType<0b0100011, 0b000,
+                 (outs), (ins XRegs:$rs1, XRegs:$rs2, Imm12:$imm),
+                 "sb $rs2, ${imm}(${rs1})">;
+def SH   : SType<0b0100011, 0b001,
+                 (outs), (ins XRegs:$rs1, XRegs:$rs2, Imm12:$imm),
+                 "sh $rs2, ${imm}(${rs1})">;
 
 //===----------------------------------------------------------------------===//
 // B-type: six conditional branches
