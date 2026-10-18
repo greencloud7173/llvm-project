@@ -134,7 +134,8 @@ private:
   void emitLoad(LoadInst &LI);
   void emitStore(StoreInst &SI);
   void emitSelect(BasicBlock &BB, SelectInst &SI);
-  void emitCall(CallInst &CI);
+  void emitCall(CallInst &CI, BasicBlock &BB);
+  void emitMinMax(CallInst &CI, BasicBlock &BB, bool IsMin, bool IsUnsigned);
   void emitCopy(Instruction &I, const Value *V);
   void emitPhiStores(BasicBlock *Pred, BasicBlock *Succ);
   void emitBranchPred(CmpInst::Predicate Pred, unsigned L, unsigned R,
@@ -574,7 +575,39 @@ void AbyssMC::emitSelect(BasicBlock &BB, SelectInst &SI) {
   Streamer->emitLabel(EndL);
 }
 
-void AbyssMC::emitCall(CallInst &CI) {
+void AbyssMC::emitMinMax(CallInst &CI, BasicBlock &BB, bool IsMin,
+                         bool IsUnsigned) {
+  if (CI.arg_size() != 2)
+    report_fatal_error("Abyss: min/max intrinsic expects two arguments");
+  loadValue(T0, CI.getArgOperand(0));
+  loadValue(T1, CI.getArgOperand(1));
+
+  MCSymbol *UseFirst = newLabel(&BB, IsMin ? "min.first" : "max.first");
+  MCSymbol *End = newLabel(&BB, IsMin ? "min.end" : "max.end");
+
+  // Branch when the first operand wins.
+  if (IsUnsigned) {
+    if (IsMin)
+      b(Abyss::BLTU, T0, T1, UseFirst);
+    else
+      b(Abyss::BLTU, T1, T0, UseFirst);
+  } else {
+    if (IsMin)
+      b(Abyss::BLT, T0, T1, UseFirst);
+    else
+      b(Abyss::BLT, T1, T0, UseFirst);
+  }
+
+  // Default: second operand.
+  i(Abyss::ADDI, T2, T1, 0);
+  jal(X0, End);
+  Streamer->emitLabel(UseFirst);
+  i(Abyss::ADDI, T2, T0, 0);
+  Streamer->emitLabel(End);
+  storeSlot(&CI, T2);
+}
+
+void AbyssMC::emitCall(CallInst &CI, BasicBlock &BB) {
   if (auto *IA = dyn_cast<InlineAsm>(CI.getCalledOperand())) {
     if (CI.getType()->isVoidTy())
       return;
@@ -596,8 +629,26 @@ void AbyssMC::emitCall(CallInst &CI) {
   Function *Callee = CI.getCalledFunction();
   if (!Callee)
     report_fatal_error("Abyss: indirect calls are not supported");
+  if (auto *II = dyn_cast<IntrinsicInst>(&CI)) {
+    switch (II->getIntrinsicID()) {
+    case Intrinsic::umin:
+      emitMinMax(CI, BB, /*IsMin=*/true, /*IsUnsigned=*/true);
+      return;
+    case Intrinsic::umax:
+      emitMinMax(CI, BB, /*IsMin=*/false, /*IsUnsigned=*/true);
+      return;
+    case Intrinsic::smin:
+      emitMinMax(CI, BB, /*IsMin=*/true, /*IsUnsigned=*/false);
+      return;
+    case Intrinsic::smax:
+      emitMinMax(CI, BB, /*IsMin=*/false, /*IsUnsigned=*/false);
+      return;
+    default:
+      break;
+    }
+  }
   if (Callee->isIntrinsic()) {
-    // Debug/lifetime intrinsics have no machine code.
+    // Debug/lifetime and other no-op intrinsics have no machine code.
     return;
   }
 
@@ -645,7 +696,7 @@ void AbyssMC::emitInstruction(Function &F, BasicBlock &BB, Instruction &I) {
     return;
   }
   if (auto *CI = dyn_cast<CallInst>(&I)) {
-    emitCall(*CI);
+    emitCall(*CI, BB);
     return;
   }
   if (auto *FI = dyn_cast<FreezeInst>(&I)) {
