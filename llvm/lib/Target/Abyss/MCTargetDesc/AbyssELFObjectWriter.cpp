@@ -2,6 +2,7 @@
 
 #include "AbyssMCFixups.h"
 #include "AbyssMCTargetDesc.h"
+#include "llvm/BinaryFormat/ELF.h"
 #include "llvm/MC/MCELFObjectWriter.h"
 #include "llvm/MC/MCFixup.h"
 #include "llvm/MC/MCValue.h"
@@ -12,26 +13,29 @@ using namespace llvm;
 
 namespace {
 
-// TODO: assign a real EM_ABYSS value and add ELFRelocs/Abyss.def once the
-// target is upstreamed.  These placeholders are enough for local testing.
-enum : unsigned { R_ABYSS_NONE = 0, R_ABYSS_32 = 1 };
-
+// Abyss uses RISC-V-compatible encodings and relocation layout.  Reuse the
+// RISC-V ELF machine/relocation types so that stock lld can link Abyss objects.
 class AbyssELFObjectWriter : public MCELFObjectTargetWriter {
 public:
   explicit AbyssELFObjectWriter(uint8_t OSABI)
-      : MCELFObjectTargetWriter(/*Is64Bit=*/false, OSABI,
-                                /*EMachine=*/0 /* EM_NONE placeholder */,
-                                /*HasRelocationAddend=*/false) {}
+      : MCELFObjectTargetWriter(/*Is64Bit=*/false, OSABI, ELF::EM_RISCV,
+                                /*HasRelocationAddend=*/true) {}
+
+  bool needsRelocateWithSymbol(const MCValue &, unsigned Type) const override {
+    return true;
+  }
 
 protected:
   unsigned getRelocType(const MCFixup &Fixup, const MCValue &,
                         bool IsPCRel) const override {
+    (void)IsPCRel;
     switch (Fixup.getKind()) {
     case FK_Data_4:
-      return R_ABYSS_32;
+      return ELF::R_RISCV_32;
     case Abyss::FK_ABYSS_BRANCH:
+      return ELF::R_RISCV_BRANCH;
     case Abyss::FK_ABYSS_JAL:
-      return IsPCRel ? R_ABYSS_32 : R_ABYSS_NONE;
+      return ELF::R_RISCV_JAL;
     default:
       llvm_unreachable("invalid fixup kind!");
     }
