@@ -1511,8 +1511,9 @@ void AbyssMC::emitInstruction(Function &F, BasicBlock &BB, Instruction &I) {
     return;
   }
   if (auto *FI = dyn_cast<FreezeInst>(&I)) {
-    // freeze of a defined integer is just an SSA rename for this target.
-    Aliases[&I] = resolve(FI->getOperand(0));
+    // Keep freeze as a real copy: aliasing it to the operand would extend the
+    // operand's live range past the point recorded by the block allocator.
+    emitCopy(I, FI->getOperand(0));
     return;
   }
   if (auto *Cast = dyn_cast<CastInst>(&I)) {
