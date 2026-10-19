@@ -21,6 +21,7 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -81,6 +82,7 @@ class AbyssMC {
 
   DenseMap<const Value *, unsigned> Slots;
   DenseMap<const AllocaInst *, int> AllocaOffsets;
+  DenseMap<const GlobalVariable *, int> GlobalConstOffsets;
   DenseMap<const BasicBlock *, std::string> BlockNames;
   DenseSet<const Value *> NeedsSlot;
   DenseSet<const Value *> NeedOwnSlot;
@@ -160,6 +162,8 @@ private:
   void flushSchedule();
   void scheduleAndEmit(SmallVectorImpl<MCInst> &Insts);
   void emitConst(unsigned Rd, int64_t Value);
+  void emitConstToMemory(unsigned Base, const Constant *C, Type *Ty,
+                         int64_t Offset);
   void loadValue(unsigned Rd, const Value *V);
   void storeSlot(const Value *V, unsigned Rs);
   unsigned destReg(const Value *V, unsigned Scratch) const;
@@ -183,6 +187,7 @@ private:
   void emitStore(StoreInst &SI);
   void emitSelect(BasicBlock &BB, SelectInst &SI);
   void emitCall(CallInst &CI, BasicBlock &BB);
+  void emitMemSet(CallInst &CI);
   void emitMinMax(CallInst &CI, BasicBlock &BB, bool IsMin, bool IsUnsigned);
   void emitCopy(Instruction &I, const Value *V);
   void emitPhiStores(BasicBlock *Pred, BasicBlock *Succ);
@@ -387,6 +392,83 @@ void AbyssMC::flushSchedule() {
   PendingInsts.clear();
 }
 
+void AbyssMC::emitConstToMemory(unsigned Base, const Constant *C, Type *Ty,
+                                int64_t Offset) {
+  auto Store = [&](unsigned Opcode, unsigned Value, int64_t Off) {
+    if (Off >= -2048 && Off <= 2047)
+      s(Opcode, Base, Value, Off);
+    else {
+      i(Abyss::ADDI, T2, Base, Off);
+      s(Opcode, T2, Value, 0);
+    }
+  };
+
+  if (auto *CI = dyn_cast<ConstantInt>(C)) {
+    emitConst(T1, CI->getSExtValue());
+    unsigned Op = Abyss::STR;
+    if (Ty->isIntegerTy(8))
+      Op = Abyss::SB;
+    else if (Ty->isIntegerTy(16))
+      Op = Abyss::SH;
+    Store(Op, T1, Offset);
+    return;
+  }
+  if (isa<UndefValue>(C) || isa<PoisonValue>(C))
+    C = Constant::getNullValue(C->getType());
+
+  const DataLayout &DL = M.getDataLayout();
+  if (isa<ConstantAggregateZero>(C)) {
+    Type *T = C->getType();
+    if (auto *AT = dyn_cast<ArrayType>(T)) {
+      Type *ET = AT->getElementType();
+      uint64_t ES = DL.getTypeAllocSize(ET).getFixedValue();
+      Constant *Zero = Constant::getNullValue(ET);
+      for (uint64_t I = 0; I != AT->getNumElements(); ++I)
+        emitConstToMemory(Base, Zero, ET,
+                          Offset + static_cast<int64_t>(I * ES));
+      return;
+    }
+    if (auto *ST = dyn_cast<StructType>(T)) {
+      const StructLayout *SL = DL.getStructLayout(ST);
+      for (unsigned I = 0; I != ST->getNumElements(); ++I) {
+        Type *ET = ST->getElementType(I);
+        emitConstToMemory(Base, Constant::getNullValue(ET), ET,
+                          Offset + static_cast<int64_t>(SL->getElementOffset(I)));
+      }
+      return;
+    }
+    emitConst(T1, 0);
+    Store(Abyss::STR, T1, Offset);
+    return;
+  }
+
+  if (auto *CA = dyn_cast<ConstantArray>(C)) {
+    Type *ET = CA->getType()->getElementType();
+    uint64_t ES = DL.getTypeAllocSize(ET).getFixedValue();
+    for (unsigned I = 0; I != CA->getNumOperands(); ++I)
+      emitConstToMemory(Base, CA->getOperand(I), ET,
+                        Offset + static_cast<int64_t>(I * ES));
+    return;
+  }
+  if (auto *CS = dyn_cast<ConstantStruct>(C)) {
+    auto *ST = CS->getType();
+    const StructLayout *SL = DL.getStructLayout(ST);
+    for (unsigned I = 0; I != CS->getNumOperands(); ++I)
+      emitConstToMemory(Base, CS->getOperand(I), ST->getElementType(I),
+                        Offset + static_cast<int64_t>(SL->getElementOffset(I)));
+    return;
+  }
+  if (auto *CD = dyn_cast<ConstantDataSequential>(C)) {
+    Type *ET = CD->getElementType();
+    uint64_t ES = DL.getTypeAllocSize(ET).getFixedValue();
+    for (unsigned I = 0; I != CD->getNumElements(); ++I)
+      emitConstToMemory(Base, CD->getElementAsConstant(I), ET,
+                        Offset + static_cast<int64_t>(I * ES));
+    return;
+  }
+  report_fatal_error("Abyss: unsupported constant aggregate");
+}
+
 void AbyssMC::emitConst(unsigned Rd, int64_t Value) {
   uint32_t U = static_cast<uint32_t>(Value);
   int32_t S = static_cast<int32_t>(U);
@@ -416,6 +498,13 @@ int AbyssMC::slotOffset(const Value *V) const {
 
 void AbyssMC::loadValue(unsigned Rd, const Value *V) {
   V = resolve(V);
+  if (auto *GV = dyn_cast<GlobalVariable>(V)) {
+    auto It = GlobalConstOffsets.find(GV);
+    if (It == GlobalConstOffsets.end())
+      report_fatal_error("Abyss: non-constant or unused global variable");
+    i(Abyss::ADDI, Rd, SP, It->second);
+    return;
+  }
   if (auto *CI = dyn_cast<ConstantInt>(V)) {
     auto It = PinnedConst.find(CI);
     if (It != PinnedConst.end()) {
@@ -710,6 +799,7 @@ void AbyssMC::emit() {
 void AbyssMC::emitFunction(Function &F) {
   Slots.clear();
   AllocaOffsets.clear();
+  GlobalConstOffsets.clear();
   Aliases.clear();
   PinnedReg.clear();
   PinnedLoop.clear();
@@ -786,6 +876,29 @@ void AbyssMC::emitFunction(Function &F) {
       Used = alignTo(Used, Align) + static_cast<int>(Size.getFixedValue());
       AllocaOffsets[AI] = -Used;
     }
+
+  // C initializers such as `int a[4] = {...}` are promoted to private constant
+  // globals by LLVM.  Materialize those constants into this thread's frame and
+  // let GEP/load use the frame address.  This keeps the normal C array syntax
+  // usable without adding a read-only data section to the Abyss memory map.
+  DenseSet<const GlobalVariable *> UsedGlobals;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      for (Value *Op : I.operands())
+        if (auto *GV = dyn_cast<GlobalVariable>(Op))
+          UsedGlobals.insert(GV);
+  for (const GlobalVariable *GV : UsedGlobals) {
+    if (!GV->hasInitializer() || GV->isDeclaration() || !GV->isConstant())
+      report_fatal_error("Abyss: non-constant global is not supported");
+    TypeSize Size = DL.getTypeAllocSize(GV->getValueType());
+    if (Size.isScalable())
+      report_fatal_error("Abyss: scalable global is not supported");
+    unsigned Align = 4;
+    if (MaybeAlign GVAlign = GV->getAlign())
+      Align = std::max<unsigned>(4, GVAlign->value());
+    Used = alignTo(Used, Align) + static_cast<int>(Size.getFixedValue());
+    GlobalConstOffsets[GV] = -Used;
+  }
   CurFrameSize = alignTo(Used, 16);
   assignLoopRegisters(F);
   MCSymbol *FnSym = Ctx->getOrCreateSymbol(FnName);
@@ -832,6 +945,13 @@ void AbyssMC::emitFunction(Function &F) {
   for (auto &KV : AllocaOffsets) {
     i(Abyss::ADDI, T0, SP, KV.second);
     storeSlot(KV.first, T0);
+  }
+
+  // Materialize the global constant initializers into the per-thread frame.
+  for (auto &KV : GlobalConstOffsets) {
+    const GlobalVariable *GV = KV.first;
+    i(Abyss::ADDI, T0, SP, KV.second);
+    emitConstToMemory(T0, GV->getInitializer(), GV->getValueType(), 0);
   }
 
   // Constant homes are loaded once in the prologue and never clobbered in a
@@ -1410,6 +1530,28 @@ void AbyssMC::emitMinMax(CallInst &CI, BasicBlock &, bool IsMin,
   storeSlot(&CI, D);
 }
 
+void AbyssMC::emitMemSet(CallInst &CI) {
+  if (CI.arg_size() < 3)
+    report_fatal_error("Abyss: malformed memset");
+  auto *Size = dyn_cast<ConstantInt>(CI.getArgOperand(2));
+  auto *Value = dyn_cast<ConstantInt>(CI.getArgOperand(1));
+  if (!Size || !Value)
+    report_fatal_error("Abyss: non-constant memset size/value");
+  uint64_t Bytes = Size->getZExtValue();
+  uint64_t V = Value->getZExtValue() & 0xFF;
+  unsigned D = operandReg(T0, CI.getArgOperand(0));
+  uint64_t Off = 0;
+  for (; Off + 4 <= Bytes; Off += 4) {
+    emitConst(T1, static_cast<int64_t>(V | (V << 8) | (V << 16) |
+                                       (V << 24)));
+    s(Abyss::STR, D, T1, static_cast<int64_t>(Off));
+  }
+  if (Off != Bytes) {
+    emitConst(T1, static_cast<int64_t>(V));
+    s(Abyss::SB, D, T1, static_cast<int64_t>(Off));
+  }
+}
+
 void AbyssMC::emitCall(CallInst &CI, BasicBlock &BB) {
   if (auto *IA = dyn_cast<InlineAsm>(CI.getCalledOperand())) {
     if (CI.getType()->isVoidTy())
@@ -1445,6 +1587,9 @@ void AbyssMC::emitCall(CallInst &CI, BasicBlock &BB) {
       return;
     case Intrinsic::smax:
       emitMinMax(CI, BB, /*IsMin=*/false, /*IsUnsigned=*/false);
+      return;
+    case Intrinsic::memset:
+      emitMemSet(CI);
       return;
     default:
       break;
