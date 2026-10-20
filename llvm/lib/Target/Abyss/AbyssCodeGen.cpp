@@ -16,10 +16,10 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
-#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/InlineAsm.h"
@@ -191,6 +191,9 @@ private:
   void emitMinMax(CallInst &CI, BasicBlock &BB, bool IsMin, bool IsUnsigned);
   void emitCopy(Instruction &I, const Value *V);
   void emitPhiStores(BasicBlock *Pred, BasicBlock *Succ);
+  bool edgeLeavesPinnedLoop(const BasicBlock *BB,
+                            const BasicBlock *Succ) const;
+  void emitPinnedExitStores(const BasicBlock *BB, const BasicBlock *Succ);
   void emitBranchPred(CmpInst::Predicate Pred, unsigned L, unsigned R,
                       MCSymbol *Target);
 
@@ -844,8 +847,14 @@ void AbyssMC::emitFunction(Function &F) {
         auto *UI = dyn_cast<Instruction>(U);
         if (!UI || UI->getParent() != &BB) {
           CrossesBlock = true;
-          // A PHI edge can read the register directly in emitPhiStores.
-          if (!isa<PHINode>(U))
+          // A PHI edge can read the register directly in emitPhiStores, but
+          // only when this block is the start of that edge.  Any other use
+          // (a non-PHI, or a PHI reached through a different predecessor)
+          // needs the value in its stack slot by the end of this block.
+          bool ReadOnEdge = false;
+          if (auto *PN = dyn_cast<PHINode>(U))
+            ReadOnEdge = PN->getBasicBlockIndex(&BB) >= 0;
+          if (!ReadOnEdge)
             NeedOwnSlot.insert(&I);
         }
       }
@@ -1019,7 +1028,11 @@ bool AbyssMC::emitPinnedPhiUpdate(BinaryOperator &BO, BasicBlock &BB) {
   auto *PN = dyn_cast<PHINode>(*BO.user_begin());
   if (!PN || !PinnedReg.count(PN))
     return false;
-  if (PN->getIncomingValueForBlock(&BB) != &BO)
+  // The update only folds into the PHI when this block is the matching edge.
+  // getIncomingValueForBlock() asserts otherwise, and valid IR may define the
+  // update in a block that only dominates the predecessor.
+  int Incoming = PN->getBasicBlockIndex(&BB);
+  if (Incoming < 0 || PN->getIncomingValue(Incoming) != &BO)
     return false;
 
   auto *C0 = dyn_cast<ConstantInt>(BO.getOperand(0));
@@ -1600,6 +1613,13 @@ void AbyssMC::emitCall(CallInst &CI, BasicBlock &BB) {
     return;
   }
 
+  // Calls may clobber every allocatable register, so spill live block-local
+  // values before the call and reload them lazily afterwards.  They are also
+  // scheduling barriers.  This has to run before the argument registers are
+  // loaded: A1..A7 are X11..X17, which the allocator may already be using.
+  flushSchedule();
+  flushBlockValues(/*Force=*/true);
+
   unsigned ArgNo = 0;
   for (Value *Arg : CI.args()) {
     if (ArgNo >= 8)
@@ -1608,11 +1628,6 @@ void AbyssMC::emitCall(CallInst &CI, BasicBlock &BB) {
     ++ArgNo;
   }
 
-  // Calls may clobber every allocatable register, so spill live block-local
-  // values before the call and reload them lazily afterwards.  They are also
-  // scheduling barriers.
-  flushSchedule();
-  flushBlockValues(/*Force=*/true);
   MCSymbol *CalleeSym = Ctx->getOrCreateSymbol(Callee->getName());
   jal(RA, CalleeSym);
   if (!CI.getType()->isVoidTy())
@@ -1761,6 +1776,29 @@ void AbyssMC::emitPhiStores(BasicBlock *Pred, BasicBlock *Succ) {
   }
 }
 
+bool AbyssMC::edgeLeavesPinnedLoop(const BasicBlock *BB,
+                                   const BasicBlock *Succ) const {
+  for (auto &KV : PinnedLoop)
+    if (KV.second->contains(BB) && !KV.second->contains(Succ))
+      return true;
+  return false;
+}
+
+// Pinned loop PHIs live only in their registers while the loop runs.  An edge
+// that leaves the loop has to materialize them into their stack slots, even
+// when the successor has no PHIs of its own: emitPhiStores() is only reached
+// through a successor's PHIs, so a plain exit block would otherwise read an
+// uninitialized slot.
+void AbyssMC::emitPinnedExitStores(const BasicBlock *BB,
+                                   const BasicBlock *Succ) {
+  for (auto &KV : PinnedLoop) {
+    const Loop *L = KV.second;
+    if (!L->contains(BB) || L->contains(Succ))
+      continue;
+    s(Abyss::STR, SP, PinnedReg.lookup(KV.first), slotOffset(KV.first));
+  }
+}
+
 void AbyssMC::emitTerminator(Function &F, BasicBlock &BB, Instruction &I) {
   (void)F;
   if (auto *RI = dyn_cast<ReturnInst>(&I)) {
@@ -1777,13 +1815,14 @@ void AbyssMC::emitTerminator(Function &F, BasicBlock &BB, Instruction &I) {
 
     if (BI->isUnconditional()) {
       BasicBlock *Succ = BI->getSuccessor(0);
-      if (!HasPhi(Succ)) {
+      if (!HasPhi(Succ) && !edgeLeavesPinnedLoop(&BB, Succ)) {
         jal(X0, blockSymbol(Succ));
         return;
       }
       MCSymbol *Edge = newLabel(&BB, "edge.u");
       jal(X0, Edge);
       Streamer->emitLabel(Edge);
+      emitPinnedExitStores(&BB, Succ);
       emitPhiStores(&BB, Succ);
       jal(X0, blockSymbol(Succ));
       return;
@@ -1798,13 +1837,18 @@ void AbyssMC::emitTerminator(Function &F, BasicBlock &BB, Instruction &I) {
 
     // Branch away on the false condition and fall through into the true
     // successor.  This removes the unconditional jump that used to sit between
-    // the branch and the true edge.  When a successor has no PHI, branch to
-    // its block directly instead of creating a one-instruction trampoline.
+    // the branch and the true edge.  When a successor has no PHI and the edge
+    // stays inside a pinned loop, branch to its block directly instead of
+    // creating a one-instruction trampoline.
     bool TruePhi = HasPhi(TrueBB);
     bool FalsePhi = HasPhi(FalseBB);
-    MCSymbol *TrueEdge = TruePhi ? newLabel(&BB, "edge.t") : nullptr;
-    MCSymbol *FalseEdge = FalsePhi ? newLabel(&BB, "edge.f") : nullptr;
-    MCSymbol *FalseTarget = FalsePhi ? FalseEdge : blockSymbol(FalseBB);
+    bool TrueExit = edgeLeavesPinnedLoop(&BB, TrueBB);
+    bool FalseExit = edgeLeavesPinnedLoop(&BB, FalseBB);
+    MCSymbol *TrueEdge =
+        (TruePhi || TrueExit) ? newLabel(&BB, "edge.t") : nullptr;
+    MCSymbol *FalseEdge =
+        (FalsePhi || FalseExit) ? newLabel(&BB, "edge.f") : nullptr;
+    MCSymbol *FalseTarget = FalseEdge ? FalseEdge : blockSymbol(FalseBB);
 
     if (auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition())) {
       unsigned L = operandReg(T0, Cmp->getOperand(0));
@@ -1816,14 +1860,16 @@ void AbyssMC::emitTerminator(Function &F, BasicBlock &BB, Instruction &I) {
       b(Abyss::BEQ, T0, X0, FalseTarget);
     }
 
-    if (TruePhi) {
+    if (TrueEdge) {
       Streamer->emitLabel(TrueEdge);
+      emitPinnedExitStores(&BB, TrueBB);
       emitPhiStores(&BB, TrueBB);
     }
     jal(X0, blockSymbol(TrueBB));
 
-    if (FalsePhi) {
+    if (FalseEdge) {
       Streamer->emitLabel(FalseEdge);
+      emitPinnedExitStores(&BB, FalseBB);
       emitPhiStores(&BB, FalseBB);
       jal(X0, blockSymbol(FalseBB));
     }
